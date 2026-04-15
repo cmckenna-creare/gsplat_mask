@@ -107,6 +107,10 @@ class DefaultStrategy(Strategy):
     revised_opacity: bool = False
     verbose: bool = False
     key_for_gradient: Literal["means2d", "gradient_2dgs"] = "means2d"
+    prune_floater: bool = False
+    prune_floater_knn: int = 4
+    prune_floater_factor: float = 10.0
+    prune_floater_every: int = 100
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -324,6 +328,30 @@ class DefaultStrategy(Strategy):
         return n_dupli, n_split
 
     @torch.no_grad()
+    def _compute_floater_mask(self, means: torch.Tensor, num_neighbors: int) -> torch.Tensor:
+        """Return a boolean mask that is True for Gaussians whose mean KNN distance
+        exceeds prune_floater_factor times the global mean KNN distance.
+
+        Uses chunked torch.cdist to bound peak memory to ~256 MB.
+        """
+        N = means.shape[0]
+        if N <= num_neighbors:
+            return torch.zeros(N, dtype=torch.bool, device=means.device)
+
+        # Target ~256 MB peak: chunk_size * N * 4 bytes <= 256 MB
+        chunk_size = max(1, min(256, (256 * 1024 * 1024) // (N * 4)))
+        knn_dists = torch.empty(N, device=means.device)
+
+        for i in range(0, N, chunk_size):
+            chunk = means[i : i + chunk_size]                              # [C, 3]
+            dists = torch.cdist(chunk, means)                              # [C, N]
+            topk, _ = dists.topk(num_neighbors + 1, largest=False, dim=-1)
+            knn_dists[i : i + chunk_size] = topk[:, 1:].mean(dim=-1)      # skip self (col 0)
+
+        threshold = self.prune_floater_factor * knn_dists.mean()
+        return knn_dists > threshold
+
+    @torch.no_grad()
     def _prune_gs(
         self,
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
@@ -346,6 +374,10 @@ class DefaultStrategy(Strategy):
                 is_too_big |= state["radii"] > self.prune_scale2d
 
             is_prune = is_prune | is_too_big
+
+        if self.prune_floater and step % self.prune_floater_every == 0:
+            is_floater = self._compute_floater_mask(params["means"], num_neighbors=self.prune_floater_knn)
+            is_prune = is_prune | is_floater
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:

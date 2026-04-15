@@ -127,6 +127,14 @@ class Config:
     grow_scale3d: float = 0.01
     # GSs with scale above this value will be pruned.
     prune_scale3d: float = 0.1
+    # Enable pruning of spatially isolated (floater) GSs
+    prune_floater: bool = False
+    # Number of nearest neighbors used to measure isolation
+    prune_floater_knn: int = 4
+    # Prune if mean KNN distance exceeds this factor times the global mean KNN distance
+    prune_floater_factor: float = 10.0
+    # Prune floaters every this many steps (should be a multiple of refine_every)
+    prune_floater_every: int = 100
 
     # Start refining GSs after this iteration
     refine_start_iter: int = 500
@@ -362,6 +370,10 @@ class Runner:
             absgrad=cfg.absgrad,
             revised_opacity=cfg.revised_opacity,
             key_for_gradient=key_for_gradient,
+            prune_floater=cfg.prune_floater,
+            prune_floater_knn=cfg.prune_floater_knn,
+            prune_floater_factor=cfg.prune_floater_factor,
+            prune_floater_every=cfg.prune_floater_every,
         )
         self.strategy.check_sanity(self.splats, self.optimizers)
         self.strategy_state = self.strategy.initialize_state()
