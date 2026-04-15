@@ -410,11 +410,17 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        mask_dir: Optional[str] = None,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.mask_dir = mask_dir
+        if mask_dir is not None and not os.path.isdir(mask_dir):
+            raise ValueError(
+                f"mask_dir does not exist or is not a directory: {mask_dir}"
+            )
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -433,6 +439,28 @@ class Dataset:
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
 
+        # Load per-image mask if mask_dir is set.
+        per_image_mask = None
+        if self.mask_dir is not None:
+            image_name = self.parser.image_names[index]
+            stem = Path(image_name).stem
+            candidates = list(Path(self.mask_dir).glob(f"{stem}.*"))
+            if candidates:
+                raw = imageio.imread(str(candidates[0]))
+                if raw.ndim == 3:
+                    raw = raw[..., 0]
+                per_image_mask = (raw > 0)
+                target_h, target_w = image.shape[:2]
+                per_image_mask = cv2.resize(
+                    per_image_mask.astype(np.uint8),
+                    (target_w, target_h),
+                    interpolation=cv2.INTER_NEAREST,
+                ).astype(bool)
+            else:
+                print(
+                    f"[Dataset] Warning: no mask found for '{image_name}' in {self.mask_dir}"
+                )
+
         if len(params) > 0:
             # Images are distorted. Undistort them.
             mapx, mapy = (
@@ -442,6 +470,10 @@ class Dataset:
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
+            if per_image_mask is not None:
+                mask_u8 = per_image_mask.astype(np.uint8) * 255
+                mask_u8 = cv2.remap(mask_u8, mapx, mapy, cv2.INTER_NEAREST)
+                per_image_mask = (mask_u8[y : y + h, x : x + w] > 0)
 
         if self.patch_size is not None:
             # Random crop.
@@ -451,6 +483,10 @@ class Dataset:
             image = image[y : y + self.patch_size, x : x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
+            if per_image_mask is not None:
+                per_image_mask = per_image_mask[
+                    y : y + self.patch_size, x : x + self.patch_size
+                ]
 
         data = {
             "K": torch.from_numpy(K).float(),
@@ -461,8 +497,15 @@ class Dataset:
                 index
             ],  # 0-based contiguous camera index
         }
-        if mask is not None:
-            data["mask"] = torch.from_numpy(mask).bool()
+        # Combine undistortion ROI mask with per-image mask.
+        if per_image_mask is not None and mask is not None:
+            combined_mask = mask & per_image_mask
+        elif per_image_mask is not None:
+            combined_mask = per_image_mask
+        else:
+            combined_mask = mask  # may be None
+        if combined_mask is not None:
+            data["mask"] = torch.from_numpy(combined_mask).bool()
 
         # Add exposure if available for this image
         exposure = self.parser.exposure_values[index]

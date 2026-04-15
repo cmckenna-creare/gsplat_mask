@@ -62,6 +62,8 @@ class Config:
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
+    # Path to folder of per-image masks (one mask per image, same stem as image filename)
+    mask_dir: Optional[str] = None
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -301,6 +303,7 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            mask_dir=cfg.mask_dir,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -610,23 +613,34 @@ class Runner:
             )
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
-                # query depths from depth map
-                points = torch.stack(
-                    [
-                        points[:, :, 0] / (width - 1) * 2 - 1,
-                        points[:, :, 1] / (height - 1) * 2 - 1,
-                    ],
-                    dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                depths = F.grid_sample(
-                    depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                depthloss = torch.tensor(0.0, device=device)
+                if masks is not None:
+                    pts_x = points[0, :, 0].long().clamp(0, width - 1)
+                    pts_y = points[0, :, 1].long().clamp(0, height - 1)
+                    valid = masks[0, pts_y, pts_x]
+                    if valid.any():
+                        points = points[:, valid, :]
+                        depths_gt = depths_gt[:, valid]
+                    else:
+                        points = None
+                if points is not None:
+                    # query depths from depth map
+                    points = torch.stack(
+                        [
+                            points[:, :, 0] / (width - 1) * 2 - 1,
+                            points[:, :, 1] / (height - 1) * 2 - 1,
+                        ],
+                        dim=-1,
+                    )  # normalize to [-1, 1]
+                    grid = points.unsqueeze(2)  # [1, M, 1, 2]
+                    depths = F.grid_sample(
+                        depths.permute(0, 3, 1, 2), grid, align_corners=True
+                    )  # [1, 1, M, 1]
+                    depths = depths.squeeze(3).squeeze(1)  # [1, M]
+                    # calculate loss in disparity space
+                    disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
+                    disp_gt = 1.0 / depths_gt  # [1, M]
+                    depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
 
             if cfg.normal_loss:
@@ -641,7 +655,10 @@ class Runner:
                     normals_from_depth = normals_from_depth.squeeze(0)
                 normals_from_depth = normals_from_depth.permute((2, 0, 1))
                 normal_error = (1 - (normals * normals_from_depth).sum(dim=0))[None]
-                normalloss = curr_normal_lambda * normal_error.mean()
+                if masks is not None and masks.any():
+                    normalloss = curr_normal_lambda * normal_error[masks].mean()
+                else:
+                    normalloss = curr_normal_lambda * normal_error.mean()
                 loss += normalloss
 
             if cfg.dist_loss:
@@ -649,7 +666,10 @@ class Runner:
                     curr_dist_lambda = cfg.dist_lambda
                 else:
                     curr_dist_lambda = 0.0
-                distloss = render_distort.mean()
+                if masks is not None and masks.any():
+                    distloss = render_distort[masks.unsqueeze(-1)].mean()
+                else:
+                    distloss = render_distort.mean()
                 loss += distloss * curr_dist_lambda
 
             loss.backward()
