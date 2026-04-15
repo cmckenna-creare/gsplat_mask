@@ -64,6 +64,13 @@ class Config:
     data_factor: int = 4
     # Path to folder of per-image masks (one mask per image, same stem as image filename)
     mask_dir: Optional[str] = None
+    # How to apply the mask during training.
+    # 'no_loss': suppress all losses in masked-out regions (pixels zeroed in GT and render).
+    # 'background_match': fill masked-out GT pixels with background_color and render with the
+    # same background so the model learns to make those regions transparent.
+    mask_mode: Literal["no_loss", "background_match"] = "no_loss"
+    # RGB background color (0–255) used when mask_mode is 'background_match'
+    background_color: Tuple[int, int, int] = (0, 255, 0)
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -276,6 +283,13 @@ class Runner:
 
         self.cfg = cfg
         self.device = "cuda"
+
+        assert not (
+            cfg.mask_mode == "background_match" and cfg.mask_dir is None
+        ), "mask_mode='background_match' requires mask_dir to be set"
+        assert not (
+            cfg.random_bkgd and cfg.mask_mode == "background_match"
+        ), "random_bkgd and mask_mode='background_match' are mutually exclusive"
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -565,6 +579,24 @@ class Runner:
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward
+            rasterize_kwargs = dict(
+                sh_degree=sh_degree_to_use,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                image_ids=image_ids,
+                render_mode="RGB+ED" if cfg.depth_loss else "RGB+D",
+                distloss=self.cfg.dist_loss,
+            )
+            if cfg.mask_mode == "background_match":
+                bg_color = (
+                    torch.tensor(
+                        cfg.background_color, dtype=torch.float32, device=device
+                    )
+                    / 255.0
+                )  # [3]
+                rasterize_kwargs["backgrounds"] = bg_color.unsqueeze(0).expand(
+                    camtoworlds.shape[0], -1
+                )  # [C, 3]
             (
                 renders,
                 alphas,
@@ -578,12 +610,7 @@ class Runner:
                 Ks=Ks,
                 width=width,
                 height=height,
-                sh_degree=sh_degree_to_use,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB+D",
-                distloss=self.cfg.dist_loss,
+                **rasterize_kwargs,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -603,8 +630,12 @@ class Runner:
             )
             masks = data["mask"].to(device) if "mask" in data else None
             if masks is not None:
-                pixels = pixels * masks[..., None]
-                colors = colors * masks[..., None]
+                if cfg.mask_mode == "no_loss":
+                    pixels = pixels * masks[..., None]
+                    colors = colors * masks[..., None]
+                else:  # background_match
+                    bg = bg_color.reshape(1, 1, 1, 3)
+                    pixels = torch.where(masks.unsqueeze(-1), pixels, bg.expand_as(pixels))
 
             # loss
             l1loss = F.l1_loss(colors, pixels)
