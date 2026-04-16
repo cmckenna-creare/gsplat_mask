@@ -25,6 +25,7 @@ from pathlib import Path
 import imageio
 import nerfview
 import numpy as np
+from matplotlib import colormaps as mpl_colormaps
 import torch
 import torch.nn.functional as F
 import tqdm
@@ -135,6 +136,8 @@ class Config:
     prune_floater_factor: float = 10.0
     # Prune floaters every this many steps (should be a multiple of refine_every)
     prune_floater_every: int = 100
+    # Save a debug render on each floater-prune step (KNN heatmap: blue=dense, red=removed)
+    debug_floater_images: bool = False
 
     # Start refining GSs after this iteration
     refine_start_iter: int = 500
@@ -377,6 +380,8 @@ class Runner:
         )
         self.strategy.check_sanity(self.splats, self.optimizers)
         self.strategy_state = self.strategy.initialize_state()
+        if cfg.debug_floater_images:
+            self.strategy.floater_debug_fn = self._on_floater_prune
 
         self.pose_optimizers = []
         if cfg.pose_opt:
@@ -825,6 +830,84 @@ class Runner:
                 )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+    @torch.no_grad()
+    def _on_floater_prune(
+        self,
+        step: int,
+        knn_dists: torch.Tensor,
+        is_floater: torch.Tensor,
+        threshold: float,
+    ) -> None:
+        """Render and save a KNN-distance heatmap on every floater-prune step.
+
+        Called from inside _prune_gs() before remove(), so all N pre-prune
+        Gaussians are still live in self.splats.
+
+        Colormap (turbo): ratio = knn_dist / threshold, clamped to [0, 2],
+        normalised to [0, 1].  Blue = dense, yellow = near threshold, red =
+        being removed (ratio > 1).
+        """
+        cfg = self.cfg
+        device = self.device
+
+        # Fixed reference camera: first training image.
+        data = self.trainset[0]
+        camtoworlds = torch.tensor(
+            data["camtoworld"], dtype=torch.float32, device=device
+        ).unsqueeze(0)
+        Ks = torch.tensor(data["K"], dtype=torch.float32, device=device).unsqueeze(0)
+        pixels = torch.tensor(data["image"], dtype=torch.float32, device=device) / 255.0
+        height, width = pixels.shape[:2]
+
+        # --- KNN heatmap render ---
+        # ratio: 0 = dense, 1 = exactly at threshold, >1 = floater (removed)
+        ratio = knn_dists.to(device) / (threshold + 1e-8)
+        ratio_norm = (ratio.clamp(0.0, 2.0) / 2.0).cpu().numpy()          # [N] in [0,1]
+        cmap = mpl_colormaps["turbo"]
+        knn_colors = torch.tensor(
+            cmap(ratio_norm)[:, :3], dtype=torch.float32, device=device
+        )  # [N, 3]
+
+        # Convert RGB to constant-color SH0 coefficient: sh0 = (color - 0.5) / SH_C0
+        SH_C0 = 0.28209479177387814
+        sh0_override = ((knn_colors - 0.5) / SH_C0).unsqueeze(1)          # [N, 1, 3]
+        saved_sh0 = self.splats["sh0"].data.clone()
+        self.splats["sh0"].data = sh0_override
+
+        (colors_knn, *_) = self.rasterize_splats(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            width=width,
+            height=height,
+            sh_degree=0,
+            near_plane=cfg.near_plane,
+            far_plane=cfg.far_plane,
+        )
+        colors_knn = colors_knn[..., :3].squeeze(0).clamp(0.0, 1.0).cpu().numpy()
+
+        self.splats["sh0"].data = saved_sh0
+
+        # --- Normal RGB render (post-prune state will be identical; this is pre-prune) ---
+        (colors_rgb, *_) = self.rasterize_splats(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            width=width,
+            height=height,
+            sh_degree=cfg.sh_degree,
+            near_plane=cfg.near_plane,
+            far_plane=cfg.far_plane,
+        )
+        colors_rgb = colors_rgb[..., :3].squeeze(0).clamp(0.0, 1.0).cpu().numpy()
+
+        # --- Composite: GT | RGB | KNN heatmap ---
+        gt = pixels.cpu().numpy()                                          # [H, W, 3]
+        canvas = np.concatenate([gt, colors_rgb, colors_knn], axis=1)     # [H, 3W, 3]
+        path = f"{self.render_dir}/floater_debug_step{step:06d}.png"
+        imageio.imwrite(path, (canvas * 255).astype(np.uint8))
+
+        n_floaters = int(is_floater.sum().item())
+        self.writer.add_scalar("train/floaters_pruned", n_floaters, step)
 
     @torch.no_grad()
     def eval(self, step: int):

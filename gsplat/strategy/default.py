@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
-from typing import Any, Dict, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import torch
 from typing_extensions import Literal
@@ -111,6 +111,10 @@ class DefaultStrategy(Strategy):
     prune_floater_knn: int = 4
     prune_floater_factor: float = 10.0
     prune_floater_every: int = 100
+    # Optional callback fired before remove() on floater-prune steps.
+    # Signature: fn(step, knn_dists, is_floater, threshold) -> None
+    # All N pre-prune Gaussians are still live in splats when this fires.
+    floater_debug_fn: Optional[Callable] = field(default=None, repr=False)
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -328,15 +332,20 @@ class DefaultStrategy(Strategy):
         return n_dupli, n_split
 
     @torch.no_grad()
-    def _compute_floater_mask(self, means: torch.Tensor, num_neighbors: int) -> torch.Tensor:
-        """Return a boolean mask that is True for Gaussians whose mean KNN distance
-        exceeds prune_floater_factor times the global mean KNN distance.
+    def _compute_floater_mask(
+        self, means: torch.Tensor, num_neighbors: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (is_floater, knn_dists) for all N Gaussians.
 
-        Uses chunked torch.cdist to bound peak memory to ~256 MB.
+        is_floater is True for Gaussians whose mean KNN distance exceeds
+        prune_floater_factor times the global mean KNN distance.
+        knn_dists[i] is Gaussian i's mean distance to its num_neighbors nearest
+        neighbors.  Uses chunked torch.cdist to bound peak memory to ~256 MB.
         """
         N = means.shape[0]
         if N <= num_neighbors:
-            return torch.zeros(N, dtype=torch.bool, device=means.device)
+            zeros = torch.zeros(N, dtype=torch.bool, device=means.device)
+            return zeros, torch.zeros(N, device=means.device)
 
         # Target ~256 MB peak: chunk_size * N * 4 bytes <= 256 MB
         chunk_size = max(1, min(256, (256 * 1024 * 1024) // (N * 4)))
@@ -349,7 +358,7 @@ class DefaultStrategy(Strategy):
             knn_dists[i : i + chunk_size] = topk[:, 1:].mean(dim=-1)      # skip self (col 0)
 
         threshold = self.prune_floater_factor * knn_dists.mean()
-        return knn_dists > threshold
+        return knn_dists > threshold, knn_dists
 
     @torch.no_grad()
     def _prune_gs(
@@ -376,8 +385,14 @@ class DefaultStrategy(Strategy):
             is_prune = is_prune | is_too_big
 
         if self.prune_floater and step % self.prune_floater_every == 0:
-            is_floater = self._compute_floater_mask(params["means"], num_neighbors=self.prune_floater_knn)
+            is_floater, knn_dists = self._compute_floater_mask(
+                params["means"], num_neighbors=self.prune_floater_knn
+            )
+            threshold = float(self.prune_floater_factor * knn_dists.mean())
             is_prune = is_prune | is_floater
+
+            if self.floater_debug_fn is not None:
+                self.floater_debug_fn(step, knn_dists, is_floater, threshold)
 
         n_prune = is_prune.sum().item()
         if n_prune > 0:
