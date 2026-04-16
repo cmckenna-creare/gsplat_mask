@@ -2378,6 +2378,7 @@ def fully_fused_projection_2dgs(
     radius_clip: float = 0.0,
     packed: bool = False,
     sparse_grad: bool = False,
+    back_culling: bool = True,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Prepare Gaussians for rasterization
 
@@ -2453,6 +2454,7 @@ def fully_fused_projection_2dgs(
             far_plane,
             radius_clip,
             sparse_grad,
+            back_culling,
         )
     else:
         return _FullyFusedProjection2DGS.apply(
@@ -2467,6 +2469,7 @@ def fully_fused_projection_2dgs(
             near_plane,
             far_plane,
             radius_clip,
+            back_culling,
         )
 
 
@@ -2487,6 +2490,7 @@ class _FullyFusedProjection2DGS(torch.autograd.Function):
         near_plane: float,
         far_plane: float,
         radius_clip: float,
+        back_culling: bool,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         radii, means2d, depths, ray_transforms, normals = _make_lazy_cuda_func(
             "projection_2dgs_fused_fwd"
@@ -2502,6 +2506,7 @@ class _FullyFusedProjection2DGS(torch.autograd.Function):
             near_plane,
             far_plane,
             radius_clip,
+            back_culling,
         )
         ctx.save_for_backward(
             means,
@@ -2573,7 +2578,7 @@ class _FullyFusedProjection2DGS(torch.autograd.Function):
             None,  # near_plane
             None,  # far_plane
             None,  # radius_clip
-            None,  # camera_model
+            None,  # back_culling
         )
 
 
@@ -2594,6 +2599,7 @@ class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
         far_plane: float,
         radius_clip: float,
         sparse_grad: bool,
+        back_culling: bool,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         (
             indptr,
@@ -2616,6 +2622,7 @@ class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
             near_plane,
             far_plane,
             radius_clip,
+            back_culling,
         )
         ctx.save_for_backward(
             batch_ids,
@@ -2742,12 +2749,11 @@ class _FullyFusedProjectionPacked2DGS(torch.autograd.Function):
             None,  # Ks
             None,  # width
             None,  # height
-            None,  # eps2d
             None,  # near_plane
             None,  # far_plane
             None,  # radius_clip
             None,  # sparse_grad
-            None,  # camera_model
+            None,  # back_culling
         )
 
 

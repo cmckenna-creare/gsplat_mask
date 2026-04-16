@@ -592,7 +592,8 @@ projection_2dgs_fused_fwd(
     double eps2d,
     double near_plane,
     double far_plane,
-    double radius_clip
+    double radius_clip,
+    bool back_culling
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -638,6 +639,7 @@ projection_2dgs_fused_fwd(
         near_plane,
         far_plane,
         radius_clip,
+        back_culling,
         // outputs
         radii,
         means2d,
@@ -735,7 +737,8 @@ projection_2dgs_packed_fwd(
     int64_t image_height,
     double near_plane,
     double far_plane,
-    double radius_clip
+    double radius_clip,
+    bool back_culling
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -771,6 +774,7 @@ projection_2dgs_packed_fwd(
             near_plane,
             far_plane,
             radius_clip,
+            back_culling,
             c10::nullopt, // block_accum
             // outputs
             block_cnts,
@@ -814,6 +818,7 @@ projection_2dgs_packed_fwd(
             near_plane,
             far_plane,
             radius_clip,
+            back_culling,
             block_accum,
             // outputs
             c10::nullopt, // block_cnts

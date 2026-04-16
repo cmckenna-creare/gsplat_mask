@@ -411,7 +411,8 @@ projection_2dgs_fused_fwd(
     double eps2d,
     double near_plane,
     double far_plane,
-    double radius_clip
+    double radius_clip,
+    bool back_culling
 );
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 projection_2dgs_fused_bwd(
@@ -454,7 +455,8 @@ projection_2dgs_packed_fwd(
     int64_t image_height,
     double near_plane,
     double far_plane,
-    double radius_clip
+    double radius_clip,
+    bool back_culling
 );
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 projection_2dgs_packed_bwd(
