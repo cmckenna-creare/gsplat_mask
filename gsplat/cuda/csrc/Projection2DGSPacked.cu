@@ -51,6 +51,7 @@ __global__ void projection_2dgs_packed_fwd_kernel(
     const scalar_t near_plane,
     const scalar_t far_plane,
     const scalar_t radius_clip,
+    const bool back_culling,          // cull Gaussians whose normal faces away from camera
     const int32_t
         *__restrict__ block_accum,    // [B * C * blocks_per_row] packing helper
     int32_t *__restrict__ block_cnts, // [B * C * blocks_per_row] packing helper
@@ -155,10 +156,15 @@ __global__ void projection_2dgs_packed_fwd_kernel(
             valid = false;
         }
 
-        // normal dual visible
+        // normal
         normal = RS_camera[2];
-        float multipler = glm::dot(-normal, mean_c) > 0 ? 1 : -1;
-        normal *= multipler;
+        float cos_val = glm::dot(-normal, mean_c);
+        if (back_culling && cos_val <= 0.0f) {
+            valid = false;
+        } else {
+            float multipler = cos_val > 0 ? 1 : -1;
+            normal *= multipler;
+        }
     }
 
     int32_t thread_data = static_cast<int32_t>(valid);
@@ -233,6 +239,7 @@ void launch_projection_2dgs_packed_fwd_kernel(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
+    const bool back_culling,
     const at::optional<at::Tensor>
         block_accum, // [B * C * blocks_per_row] packing helper
     // outputs
@@ -280,6 +287,7 @@ void launch_projection_2dgs_packed_fwd_kernel(
             near_plane,
             far_plane,
             radius_clip,
+            back_culling,
             block_accum.has_value() ? block_accum.value().data_ptr<int32_t>()
                                     : nullptr,
             block_cnts.has_value() ? block_cnts.value().data_ptr<int32_t>()

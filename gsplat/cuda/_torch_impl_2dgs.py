@@ -35,6 +35,7 @@ def _fully_fused_projection_2dgs(
     near_plane: float = 0.01,
     far_plane: float = 1e10,
     eps: float = 0,
+    back_culling: bool = True,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """PyTorch implementation of `gsplat.cuda._wrapper.fully_fused_projection_2dgs()`
 
@@ -64,8 +65,11 @@ def _fully_fused_projection_2dgs(
     normals = RS_cl[..., 2]  # [..., C, N, 3]
     cos = -normals.reshape((-1, 1, 3)) @ means_c.reshape((-1, 3, 1))
     cos = cos.reshape(batch_dims + (C, N, 1))
-    multiplier = torch.where(cos > 0, torch.tensor(1.0), torch.tensor(-1.0))
-    normals *= multiplier
+    if back_culling:
+        back_facing = cos.squeeze(-1) <= 0  # [..., C, N]
+    else:
+        multiplier = torch.where(cos > 0, torch.tensor(1.0), torch.tensor(-1.0))
+        normals *= multiplier
 
     # ray transform matrix, omitting the z rotation
     T_cl = torch.cat([RS_cl[..., :2], means_c[..., None]], dim=-1)  # [..., C, N, 3, 3]
@@ -103,6 +107,8 @@ def _fully_fused_projection_2dgs(
         & (means2d[..., 1] - radius[..., 1] < height)
     )
     radius[~inside] = 0.0
+    if back_culling:
+        radius[back_facing] = 0.0
     radii = radius.int()
     M = torch.transpose(M, -1, -2)  # [..., C, N, 3, 3]
     return radii, means2d, depths, M, normals

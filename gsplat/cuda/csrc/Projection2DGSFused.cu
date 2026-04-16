@@ -75,7 +75,8 @@ __global__ void projection_2dgs_fused_fwd_kernel(
                                       // that transform xy-planes in pixel
                                       // spaces into splat coordinates (WH)^T in
                                       // equation (9) in paper
-    scalar_t *__restrict__ normals    // [B, C, N, 3] The normals in camera spaces.
+    scalar_t *__restrict__ normals,   // [B, C, N, 3] The normals in camera spaces.
+    const bool back_culling           // cull Gaussians whose normal faces away from camera
 ) {
 
     /**
@@ -256,10 +257,15 @@ __global__ void projection_2dgs_fused_fwd_kernel(
         return;
     }
 
-    // normals dual visible
+    // normals
     vec3 normal = RS_camera[2];
-    // flip normal if it is pointing away from the camera
-    float multipler = glm::dot(-normal, mean_c) > 0 ? 1 : -1;
+    float cos_val = glm::dot(-normal, mean_c);
+    if (back_culling && cos_val <= 0.0f) {
+        radii[idx * 2]     = 0;
+        radii[idx * 2 + 1] = 0;
+        return;
+    }
+    float multipler = cos_val > 0 ? 1 : -1;
     normal *= multipler;
 
     // write to outputs
@@ -298,6 +304,7 @@ void launch_projection_2dgs_fused_fwd_kernel(
     const float near_plane,
     const float far_plane,
     const float radius_clip,
+    const bool back_culling,
     // outputs
     at::Tensor radii,          // [..., C, N, 2]
     at::Tensor means2d,        // [..., C, N, 2]
@@ -338,7 +345,8 @@ void launch_projection_2dgs_fused_fwd_kernel(
             means2d.data_ptr<float>(),
             depths.data_ptr<float>(),
             ray_transforms.data_ptr<float>(),
-            normals.data_ptr<float>()
+            normals.data_ptr<float>(),
+            back_culling
         );
 }
 
