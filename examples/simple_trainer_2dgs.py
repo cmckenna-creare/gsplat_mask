@@ -853,11 +853,9 @@ class Runner:
 
         # Fixed reference camera: first training image.
         data = self.trainset[0]
-        camtoworlds = torch.tensor(
-            data["camtoworld"], dtype=torch.float32, device=device
-        ).unsqueeze(0)
-        Ks = torch.tensor(data["K"], dtype=torch.float32, device=device).unsqueeze(0)
-        pixels = torch.tensor(data["image"], dtype=torch.float32, device=device) / 255.0
+        camtoworlds = data["camtoworld"].float().to(device).unsqueeze(0)
+        Ks = data["K"].float().to(device).unsqueeze(0)
+        pixels = data["image"].float().to(device) / 255.0
         height, width = pixels.shape[:2]
 
         # --- KNN heatmap render ---
