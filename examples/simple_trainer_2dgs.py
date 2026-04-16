@@ -860,9 +860,21 @@ class Runner:
 
         # --- KNN heatmap render ---
         # ratio: 0 = dense, 1 = exactly at threshold, >1 = floater (removed)
-        ratio = knn_dists.to(device) / (threshold + 1e-8)
-        ratio_norm = (ratio.clamp(0.0, 2.0) / 2.0).cpu().numpy()          # [N] in [0,1]
-        cmap = mpl_colormaps["turbo"]
+        # Piecewise normalisation so the threshold is a hard visual boundary.
+        # Survivors (ratio < 1) → [0, 0.5): blue (dense) → yellow (near threshold).
+        # Floaters  (ratio ≥ 1) → [0.5, 1.0]: yellow-orange → deep red.
+        # Within the floater half the range is stretched to the actual max ratio so
+        # even mild floaters show as clearly orange rather than all bunching at 0.5.
+        ratio_np = (knn_dists.to(device) / (threshold + 1e-8)).cpu().numpy()  # [N]
+        floater_mask = ratio_np >= 1.0
+        floater_max = float(ratio_np[floater_mask].max()) if floater_mask.any() else 2.0
+        ratio_norm = np.where(
+            floater_mask,
+            0.5 + 0.5 * np.clip((ratio_np - 1.0) / max(floater_max - 1.0, 1e-6), 0, 1),
+            np.clip(ratio_np, 0.0, 1.0) * 0.5,
+        )
+        # RdYlBu_r: blue=safe, yellow=near-threshold, red=floater
+        cmap = mpl_colormaps["RdYlBu_r"]
         knn_colors = torch.tensor(
             cmap(ratio_norm)[:, :3], dtype=torch.float32, device=device
         )  # [N, 3]
