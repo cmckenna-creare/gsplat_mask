@@ -68,6 +68,18 @@ def main(local_rank: int, world_rank, world_size: int, args):
         K = torch.from_numpy(K).float().to(device)
         viewmat = c2w.inverse()
 
+        if render_tab_state.min_opacity > 0.0:
+            mask = opacities >= render_tab_state.min_opacity
+            r_means = means[mask]
+            r_quats = quats[mask]
+            r_scales = scales[mask]
+            r_opacities = opacities[mask]
+            r_colors = colors[mask]
+        else:
+            r_means, r_quats, r_scales, r_opacities, r_colors = (
+                means, quats, scales, opacities, colors
+            )
+
         (
             render_colors,
             render_alphas,
@@ -77,11 +89,11 @@ def main(local_rank: int, world_rank, world_size: int, args):
             render_median,
             info,
         ) = rasterization_2dgs(
-            means=means,
-            quats=quats,
-            scales=scales,
-            opacities=opacities,
-            colors=colors,
+            means=r_means,
+            quats=r_quats,
+            scales=r_scales,
+            opacities=r_opacities,
+            colors=r_colors,
             viewmats=viewmat[None],
             Ks=K[None],
             width=width,
@@ -99,7 +111,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
             backgrounds=torch.tensor([render_tab_state.backgrounds], device=device)
             / 255.0,
         )
-        render_tab_state.total_gs_count = len(means)
+        render_tab_state.total_gs_count = len(means)  # unfiltered total
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()
 
         if render_tab_state.render_mode == "depth":
