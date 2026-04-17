@@ -22,6 +22,8 @@ from typing_extensions import Literal
 from .base import Strategy
 from .ops import duplicate, remove, reset_opa, split
 
+SH_C0 = 0.28209479177387814  # DC SH coefficient: color = sh0 * SH_C0 + 0.5
+
 
 @dataclass
 class DefaultStrategy(Strategy):
@@ -115,6 +117,11 @@ class DefaultStrategy(Strategy):
     # Signature: fn(step, knn_dists, is_floater, threshold) -> None
     # All N pre-prune Gaussians are still live in splats when this fires.
     floater_debug_fn: Optional[Callable] = field(default=None, repr=False)
+    # Prune Gaussians whose DC SH base color is close to the background.
+    # Set prune_bg_color_rgb to the background color in [0, 1].
+    prune_bg_color: bool = False
+    prune_bg_color_rgb: Optional[Tuple[float, float, float]] = None
+    prune_bg_color_threshold: float = 0.1
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -394,8 +401,50 @@ class DefaultStrategy(Strategy):
             if self.floater_debug_fn is not None:
                 self.floater_debug_fn(step, knn_dists, is_floater, threshold)
 
+        if self.prune_bg_color:
+            is_prune = is_prune | self._compute_bg_color_mask(params)
+
         n_prune = is_prune.sum().item()
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=is_prune)
 
+        return n_prune
+
+    @torch.no_grad()
+    def _compute_bg_color_mask(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    ) -> torch.Tensor:
+        """Return True for Gaussians whose base color (DC SH term) is within
+        prune_bg_color_threshold of prune_bg_color_rgb."""
+        assert self.prune_bg_color_rgb is not None, (
+            "prune_bg_color_rgb must be set when prune_bg_color=True"
+        )
+        base_rgb = params["sh0"][:, 0, :] * SH_C0 + 0.5  # [N, 3]
+        base_rgb = base_rgb.clamp(0.0, 1.0)
+        bg = torch.tensor(
+            self.prune_bg_color_rgb, dtype=torch.float32, device=base_rgb.device
+        )
+        return (base_rgb - bg).norm(dim=-1) < self.prune_bg_color_threshold
+
+    @torch.no_grad()
+    def prune_bg_color_gaussians(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Any],
+    ) -> int:
+        """Remove background-colored Gaussians. Called by the trainer at save
+        steps; the refine_every cadence is handled automatically via _prune_gs."""
+        if not self.prune_bg_color:
+            return 0
+        is_bg = self._compute_bg_color_mask(params)
+        n_prune = int(is_bg.sum().item())
+        if n_prune > 0:
+            remove(params=params, optimizers=optimizers, state=state, mask=is_bg)
+        if self.verbose:
+            print(
+                f"Pruned {n_prune} background-colored Gaussians. "
+                f"Remaining: {len(params['means'])}"
+            )
         return n_prune

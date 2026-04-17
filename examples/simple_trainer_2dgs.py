@@ -51,6 +51,8 @@ from gsplat.rendering import rasterization_2dgs, rasterization_2dgs_inria_wrappe
 from gsplat.strategy import DefaultStrategy
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
+SH_C0 = 0.28209479177387814  # DC SH coefficient: color = sh0 * SH_C0 + 0.5
+
 
 @dataclass
 class Config:
@@ -128,6 +130,11 @@ class Config:
     grow_scale3d: float = 0.01
     # GSs with scale above this value will be pruned.
     prune_scale3d: float = 0.1
+    # Prune Gaussians whose base color is close to background_color (background_match mode only)
+    prune_bg_color: bool = False
+    # L2 distance threshold in [0, 1] RGB space; Gaussians closer than this are pruned
+    prune_bg_color_threshold: float = 0.1
+
     # Enable pruning of spatially isolated (floater) GSs
     prune_floater: bool = False
     # Number of nearest neighbors used to measure isolation
@@ -377,6 +384,9 @@ class Runner:
             prune_floater_knn=cfg.prune_floater_knn,
             prune_floater_factor=cfg.prune_floater_factor,
             prune_floater_every=cfg.prune_floater_every,
+            prune_bg_color=cfg.prune_bg_color and cfg.mask_mode == "background_match",
+            prune_bg_color_rgb=tuple(c / 255.0 for c in cfg.background_color),
+            prune_bg_color_threshold=cfg.prune_bg_color_threshold,
         )
         self.strategy.check_sanity(self.splats, self.optimizers)
         self.strategy_state = self.strategy.initialize_state()
@@ -796,6 +806,9 @@ class Runner:
 
             # save checkpoint
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
+                self.strategy.prune_bg_color_gaussians(
+                    self.splats, self.optimizers, self.strategy_state
+                )
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 stats = {
                     "mem": mem,
@@ -880,7 +893,6 @@ class Runner:
         )  # [N, 3]
 
         # Convert RGB to constant-color SH0 coefficient: sh0 = (color - 0.5) / SH_C0
-        SH_C0 = 0.28209479177387814
         sh0_override = ((knn_colors - 0.5) / SH_C0).unsqueeze(1)          # [N, 1, 3]
         saved_sh0 = self.splats["sh0"].data.clone()
         self.splats["sh0"].data = sh0_override
