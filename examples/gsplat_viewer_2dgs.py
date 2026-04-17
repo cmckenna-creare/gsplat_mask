@@ -33,6 +33,7 @@ class GsplatRenderTabState(RenderTabState):
     min_opacity: float = 0.0
     eps2d: float = 0.3
     backgrounds: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    bg_color_filter_threshold: float = 0.0
     render_mode: Literal[
         "rgb", "depth(accumulated)", "depth(expected)", "alpha"
     ] = "rgb"
@@ -167,6 +168,20 @@ class GsplatViewer(Viewer):
                     self.render_tab_state.backgrounds = backgrounds_slider.value
                     self.rerender(_)
 
+                bg_color_filter_slider = server.gui.add_slider(
+                    "BG Color Filter",
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    initial_value=self.render_tab_state.bg_color_filter_threshold,
+                    hint="Remove splats whose base color L2 distance to the background is below this threshold.",
+                )
+
+                @bg_color_filter_slider.on_update
+                def _(_) -> None:
+                    self.render_tab_state.bg_color_filter_threshold = bg_color_filter_slider.value
+                    self.rerender(_)
+
                 render_mode_dropdown = server.gui.add_dropdown(
                     "Render Mode",
                     ("rgb", "depth", "normal", "alpha"),
@@ -232,6 +247,7 @@ class GsplatViewer(Viewer):
                 "min_opacity_slider": min_opacity_slider,
                 "eps2d_slider": eps2d_slider,
                 "backgrounds_slider": backgrounds_slider,
+                "bg_color_filter_slider": bg_color_filter_slider,
                 "render_mode_dropdown": render_mode_dropdown,
                 "normalize_nearfar_checkbox": normalize_nearfar_checkbox,
                 "inverse_checkbox": inverse_checkbox,

@@ -68,8 +68,16 @@ def main(local_rank: int, world_rank, world_size: int, args):
         K = torch.from_numpy(K).float().to(device)
         viewmat = c2w.inverse()
 
+        mask = torch.ones(len(means), dtype=torch.bool, device=device)
         if render_tab_state.min_opacity > 0.0:
-            mask = opacities >= render_tab_state.min_opacity
+            mask &= opacities >= render_tab_state.min_opacity
+        if render_tab_state.bg_color_filter_threshold > 0.0:
+            SH_C0 = 0.28209479177387814
+            base_rgb = (colors[:, 0, :] * SH_C0 + 0.5).clamp(0.0, 1.0)
+            bg = torch.tensor(render_tab_state.backgrounds, dtype=torch.float32, device=device) / 255.0
+            l2_dist = (base_rgb - bg).norm(dim=-1)
+            mask &= l2_dist >= render_tab_state.bg_color_filter_threshold
+        if not mask.all():
             r_means = means[mask]
             r_quats = quats[mask]
             r_scales = scales[mask]
