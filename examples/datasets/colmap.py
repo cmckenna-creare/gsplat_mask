@@ -417,6 +417,7 @@ class Dataset:
         self.patch_size = patch_size
         self.load_depths = load_depths
         self.mask_dir = mask_dir
+        self._mask_warned = False
         if mask_dir is not None and not os.path.isdir(mask_dir):
             raise ValueError(
                 f"mask_dir does not exist or is not a directory: {mask_dir}"
@@ -456,10 +457,11 @@ class Dataset:
                     (target_w, target_h),
                     interpolation=cv2.INTER_NEAREST,
                 ).astype(bool)
-            else:
+            elif not self._mask_warned:
                 print(
-                    f"[Dataset] Warning: no mask found for '{image_name}' in {self.mask_dir}"
+                    f"[Dataset] Warning: no mask found for '{image_name}' in {self.mask_dir} (further warnings suppressed)"
                 )
+                self._mask_warned = True
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
