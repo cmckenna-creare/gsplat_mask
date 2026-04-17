@@ -411,6 +411,7 @@ class Dataset:
         patch_size: Optional[int] = None,
         load_depths: bool = False,
         mask_dir: Optional[str] = None,
+        mask_only: bool = False,
     ):
         self.parser = parser
         self.split = split
@@ -427,6 +428,17 @@ class Dataset:
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
+        if mask_only and mask_dir is not None:
+            mask_dir_path = Path(mask_dir)
+            has_mask = [
+                bool(list(mask_dir_path.glob(f"{Path(self.parser.image_names[i]).stem}.*")))
+                for i in self.indices
+            ]
+            n_before = len(self.indices)
+            self.indices = self.indices[np.array(has_mask)]
+            print(
+                f"[Dataset] mask_only: kept {len(self.indices)}/{n_before} {split} images with masks."
+            )
 
     def __len__(self):
         return len(self.indices)

@@ -72,6 +72,8 @@ class Config:
     # 'background_match': fill masked-out GT pixels with background_color and render with the
     # same background so the model learns to make those regions transparent.
     mask_mode: Literal["no_loss", "background_match"] = "no_loss"
+    # If True, skip training images that have no corresponding mask file in mask_dir.
+    mask_only: bool = False
     # RGB background color (0–255) used when mask_mode is 'background_match'
     background_color: Tuple[int, int, int] = (0, 255, 0)
     # Directory to save results
@@ -306,6 +308,9 @@ class Runner:
             cfg.mask_mode == "background_match" and cfg.mask_dir is None
         ), "mask_mode='background_match' requires mask_dir to be set"
         assert not (
+            cfg.mask_only and cfg.mask_dir is None
+        ), "mask_only=True requires mask_dir to be set"
+        assert not (
             cfg.random_bkgd and cfg.mask_mode == "background_match"
         ), "random_bkgd and mask_mode='background_match' are mutually exclusive"
 
@@ -336,6 +341,7 @@ class Runner:
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
             mask_dir=cfg.mask_dir,
+            mask_only=cfg.mask_only,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
