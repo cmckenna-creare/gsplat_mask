@@ -429,30 +429,6 @@ class Dataset:
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
-        if objects_of_interest_mask_dir is not None and background_mask_dir is None:
-            ooi_dir_path = Path(objects_of_interest_mask_dir)
-            has_mask = [
-                bool(list(ooi_dir_path.glob(f"{Path(self.parser.image_names[i]).stem}.*")))
-                for i in self.indices
-            ]
-            n_before = len(self.indices)
-            self.indices = self.indices[np.array(has_mask)]
-            print(
-                f"[Dataset] ooi_mask_dir only: kept {len(self.indices)}/{n_before} {split} images with OOI masks."
-            )
-        elif objects_of_interest_mask_dir is not None and background_mask_dir is not None:
-            ooi_dir_path = Path(objects_of_interest_mask_dir)
-            bg_dir_path = Path(background_mask_dir)
-            has_mask = [
-                bool(list(ooi_dir_path.glob(f"{Path(self.parser.image_names[i]).stem}.*")))
-                or bool(list(bg_dir_path.glob(f"{Path(self.parser.image_names[i]).stem}.*")))
-                for i in self.indices
-            ]
-            n_before = len(self.indices)
-            self.indices = self.indices[np.array(has_mask)]
-            print(
-                f"[Dataset] both mask dirs: kept {len(self.indices)}/{n_before} {split} images with at least one mask."
-            )
 
     def __len__(self):
         return len(self.indices)
@@ -528,6 +504,11 @@ class Dataset:
                 bg_mask = bg_mask[y : y + self.patch_size, x : x + self.patch_size]
             if ooi_mask is not None:
                 ooi_mask = ooi_mask[y : y + self.patch_size, x : x + self.patch_size]
+
+        # If ooi_mask_dir is set but no ooi mask was found, and no bg mask was found either,
+        # treat the background as covering the entire image.
+        if self.ooi_mask_dir is not None and ooi_mask is None and bg_mask is None:
+            bg_mask = np.ones(image.shape[:2], dtype=bool)
 
         # Combine per-image masks with the undistortion ROI mask.
         # cam_mask clips both user masks to the valid undistorted region. If no ooi_mask
