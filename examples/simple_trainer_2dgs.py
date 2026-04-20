@@ -65,16 +65,17 @@ class Config:
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
-    # Path to folder of per-image masks (one mask per image, same stem as image filename)
-    mask_dir: Optional[str] = None
-    # How to apply the mask during training.
-    # 'no_loss': suppress all losses in masked-out regions (pixels zeroed in GT and render).
-    # 'background_match': fill masked-out GT pixels with background_color and render with the
-    # same background so the model learns to make those regions transparent.
-    mask_mode: Literal["no_loss", "background_match"] = "no_loss"
-    # If True, skip training images that have no corresponding mask file in mask_dir.
-    mask_only: bool = False
-    # RGB background color (0–255) used when mask_mode is 'background_match'
+    # Path to folder of per-image background masks. Where True, background_match masking is
+    # applied: GT pixels are set to background_color and the rasterizer is set to the same
+    # background so Gaussians in those regions learn to be transparent.
+    background_mask_dir: Optional[str] = None
+    # Path to folder of per-image objects-of-interest masks. Defines the region to keep:
+    # pixels outside this mask (and not covered by background_mask_dir) have their loss
+    # zeroed out. background_mask_dir takes priority over objects_of_interest_mask_dir.
+    objects_of_interest_mask_dir: Optional[str] = None
+    # If True, skip training images that have no corresponding mask in objects_of_interest_mask_dir.
+    object_of_interest_only: bool = False
+    # RGB background color (0–255) used for background_mask regions
     background_color: Tuple[int, int, int] = (0, 255, 0)
     # Directory to save results
     result_dir: str = "results/garden"
@@ -132,7 +133,7 @@ class Config:
     grow_scale3d: float = 0.01
     # GSs with scale above this value will be pruned.
     prune_scale3d: float = 0.1
-    # Prune Gaussians whose base color is close to background_color (background_match mode only)
+    # Prune Gaussians whose base color is close to background_color (requires background_mask_dir)
     prune_bg_color: bool = False
     # L2 distance threshold in [0, 1] RGB space; Gaussians closer than this are pruned
     prune_bg_color_threshold: float = 0.1
@@ -305,14 +306,11 @@ class Runner:
         self.device = "cuda"
 
         assert not (
-            cfg.mask_mode == "background_match" and cfg.mask_dir is None
-        ), "mask_mode='background_match' requires mask_dir to be set"
+            cfg.object_of_interest_only and cfg.objects_of_interest_mask_dir is None
+        ), "object_of_interest_only=True requires objects_of_interest_mask_dir to be set"
         assert not (
-            cfg.mask_only and cfg.mask_dir is None
-        ), "mask_only=True requires mask_dir to be set"
-        assert not (
-            cfg.random_bkgd and cfg.mask_mode == "background_match"
-        ), "random_bkgd and mask_mode='background_match' are mutually exclusive"
+            cfg.random_bkgd and cfg.background_mask_dir is not None
+        ), "random_bkgd and background_mask_dir are mutually exclusive"
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -340,8 +338,9 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
-            mask_dir=cfg.mask_dir,
-            mask_only=cfg.mask_only,
+            background_mask_dir=cfg.background_mask_dir,
+            objects_of_interest_mask_dir=cfg.objects_of_interest_mask_dir,
+            object_of_interest_only=cfg.object_of_interest_only,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -390,7 +389,7 @@ class Runner:
             prune_floater_knn=cfg.prune_floater_knn,
             prune_floater_factor=cfg.prune_floater_factor,
             prune_floater_every=cfg.prune_floater_every,
-            prune_bg_color=cfg.prune_bg_color and cfg.mask_mode == "background_match",
+            prune_bg_color=cfg.prune_bg_color and cfg.background_mask_dir is not None,
             prune_bg_color_rgb=tuple(c / 255.0 for c in cfg.background_color),
             prune_bg_color_threshold=cfg.prune_bg_color_threshold,
         )
@@ -573,6 +572,10 @@ class Runner:
         )
         trainloader_iter = iter(trainloader)
 
+        bg_color = (
+            torch.tensor(cfg.background_color, dtype=torch.float32, device=device) / 255.0
+        )  # [3]
+
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
@@ -620,13 +623,7 @@ class Runner:
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB+D",
                 distloss=self.cfg.dist_loss,
             )
-            if cfg.mask_mode == "background_match":
-                bg_color = (
-                    torch.tensor(
-                        cfg.background_color, dtype=torch.float32, device=device
-                    )
-                    / 255.0
-                )  # [3]
+            if "background_mask" in data:
                 rasterize_kwargs["backgrounds"] = bg_color.unsqueeze(0).expand(
                     camtoworlds.shape[0], -1
                 )  # [C, 3]
@@ -661,14 +658,20 @@ class Runner:
                 step=step,
                 info=info,
             )
-            masks = data["mask"].to(device) if "mask" in data else None
-            if masks is not None:
-                if cfg.mask_mode == "no_loss":
-                    pixels = pixels * masks[..., None]
-                    colors = colors * masks[..., None]
-                else:  # background_match
-                    bg = bg_color.reshape(1, 1, 1, 3)
-                    pixels = torch.where(masks.unsqueeze(-1), pixels, bg.expand_as(pixels))
+            bg_mask = data["background_mask"].to(device) if "background_mask" in data else None
+            ooi_mask = data["ooi_mask"].to(device) if "ooi_mask" in data else None
+
+            # Zero out no-loss regions: outside ooi AND outside bg.
+            if ooi_mask is not None:
+                keep = ooi_mask | bg_mask if bg_mask is not None else ooi_mask
+                pixels = pixels * keep.unsqueeze(-1).float()
+                colors = colors * keep.unsqueeze(-1).float()
+
+            # Replace GT pixels in background regions with bg_color.
+            # The rasterizer already outputs bg_color in transparent regions.
+            if bg_mask is not None:
+                bg = bg_color.reshape(1, 1, 1, 3)
+                pixels = torch.where(bg_mask.unsqueeze(-1), bg.expand_as(pixels), pixels)
 
             # loss
             l1loss = F.l1_loss(colors, pixels)
@@ -678,10 +681,10 @@ class Runner:
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
                 depthloss = torch.tensor(0.0, device=device)
-                if masks is not None:
+                if ooi_mask is not None:
                     pts_x = points[0, :, 0].long().clamp(0, width - 1)
                     pts_y = points[0, :, 1].long().clamp(0, height - 1)
-                    valid = masks[0, pts_y, pts_x]
+                    valid = ooi_mask[0, pts_y, pts_x]
                     if valid.any():
                         points = points[:, valid, :]
                         depths_gt = depths_gt[:, valid]
@@ -719,8 +722,8 @@ class Runner:
                     normals_from_depth = normals_from_depth.squeeze(0)
                 normals_from_depth = normals_from_depth.permute((2, 0, 1))
                 normal_error = (1 - (normals * normals_from_depth).sum(dim=0))[None]
-                if masks is not None and masks.any():
-                    normalloss = curr_normal_lambda * normal_error[masks].mean()
+                if ooi_mask is not None and ooi_mask.any():
+                    normalloss = curr_normal_lambda * normal_error[ooi_mask].mean()
                 else:
                     normalloss = curr_normal_lambda * normal_error.mean()
                 loss += normalloss
@@ -730,8 +733,8 @@ class Runner:
                     curr_dist_lambda = cfg.dist_lambda
                 else:
                     curr_dist_lambda = 0.0
-                if masks is not None and masks.any():
-                    distloss = render_distort[masks.unsqueeze(-1)].mean()
+                if ooi_mask is not None and ooi_mask.any():
+                    distloss = render_distort[ooi_mask.unsqueeze(-1)].mean()
                 else:
                     distloss = render_distort.mean()
                 loss += distloss * curr_dist_lambda

@@ -410,38 +410,62 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
-        mask_dir: Optional[str] = None,
-        mask_only: bool = False,
+        background_mask_dir: Optional[str] = None,
+        objects_of_interest_mask_dir: Optional[str] = None,
+        object_of_interest_only: bool = False,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
-        self.mask_dir = mask_dir
-        self._mask_warned = False
-        if mask_dir is not None and not os.path.isdir(mask_dir):
-            raise ValueError(
-                f"mask_dir does not exist or is not a directory: {mask_dir}"
-            )
+        self.background_mask_dir = background_mask_dir
+        self.ooi_mask_dir = objects_of_interest_mask_dir
+        self._bg_mask_warned = False
+        self._ooi_mask_warned = False
+        for label, d in [("background_mask_dir", background_mask_dir), ("objects_of_interest_mask_dir", objects_of_interest_mask_dir)]:
+            if d is not None and not os.path.isdir(d):
+                raise ValueError(f"{label} does not exist or is not a directory: {d}")
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
-        if mask_only and mask_dir is not None:
-            mask_dir_path = Path(mask_dir)
-            has_mask = [
-                bool(list(mask_dir_path.glob(f"{Path(self.parser.image_names[i]).stem}.*")))
+        if object_of_interest_only and objects_of_interest_mask_dir is not None:
+            ooi_dir_path = Path(objects_of_interest_mask_dir)
+            has_ooi_mask = [
+                bool(list(ooi_dir_path.glob(f"{Path(self.parser.image_names[i]).stem}.*")))
                 for i in self.indices
             ]
             n_before = len(self.indices)
-            self.indices = self.indices[np.array(has_mask)]
+            self.indices = self.indices[np.array(has_ooi_mask)]
             print(
-                f"[Dataset] mask_only: kept {len(self.indices)}/{n_before} {split} images with masks."
+                f"[Dataset] object_of_interest_only: kept {len(self.indices)}/{n_before} {split} images with OOI masks."
             )
 
     def __len__(self):
         return len(self.indices)
+
+    def _load_mask_file(
+        self, mask_dir: str, image_name: str, target_h: int, target_w: int, warned_attr: str
+    ) -> Optional[np.ndarray]:
+        stem = Path(image_name).stem
+        candidates = list(Path(mask_dir).glob(f"{stem}.*"))
+        if not candidates:
+            if not getattr(self, warned_attr):
+                print(
+                    f"[Dataset] Warning: no mask found for '{image_name}' in {mask_dir} "
+                    f"(further warnings suppressed)"
+                )
+                setattr(self, warned_attr, True)
+            return None
+        raw = imageio.imread(str(candidates[0]))
+        if raw.ndim == 3:
+            raw = raw[..., 0]
+        return cv2.resize(
+            (raw > 0).astype(np.uint8),
+            (target_w, target_h),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
@@ -450,30 +474,19 @@ class Dataset:
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
-        mask = self.parser.mask_dict[camera_id]
+        cam_mask = self.parser.mask_dict[camera_id]
+        image_name = self.parser.image_names[index]
 
-        # Load per-image mask if mask_dir is set.
-        per_image_mask = None
-        if self.mask_dir is not None:
-            image_name = self.parser.image_names[index]
-            stem = Path(image_name).stem
-            candidates = list(Path(self.mask_dir).glob(f"{stem}.*"))
-            if candidates:
-                raw = imageio.imread(str(candidates[0]))
-                if raw.ndim == 3:
-                    raw = raw[..., 0]
-                per_image_mask = (raw > 0)
-                target_h, target_w = image.shape[:2]
-                per_image_mask = cv2.resize(
-                    per_image_mask.astype(np.uint8),
-                    (target_w, target_h),
-                    interpolation=cv2.INTER_NEAREST,
-                ).astype(bool)
-            elif not self._mask_warned:
-                print(
-                    f"[Dataset] Warning: no mask found for '{image_name}' in {self.mask_dir} (further warnings suppressed)"
-                )
-                self._mask_warned = True
+        # Load per-image masks from both directories.
+        target_h, target_w = image.shape[:2]
+        bg_mask = (
+            self._load_mask_file(self.background_mask_dir, image_name, target_h, target_w, "_bg_mask_warned")
+            if self.background_mask_dir is not None else None
+        )
+        ooi_mask = (
+            self._load_mask_file(self.ooi_mask_dir, image_name, target_h, target_w, "_ooi_mask_warned")
+            if self.ooi_mask_dir is not None else None
+        )
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -484,10 +497,12 @@ class Dataset:
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
-            if per_image_mask is not None:
-                mask_u8 = per_image_mask.astype(np.uint8) * 255
-                mask_u8 = cv2.remap(mask_u8, mapx, mapy, cv2.INTER_NEAREST)
-                per_image_mask = (mask_u8[y : y + h, x : x + w] > 0)
+            if bg_mask is not None:
+                m = cv2.remap(bg_mask.astype(np.uint8) * 255, mapx, mapy, cv2.INTER_NEAREST)
+                bg_mask = (m[y : y + h, x : x + w] > 0)
+            if ooi_mask is not None:
+                m = cv2.remap(ooi_mask.astype(np.uint8) * 255, mapx, mapy, cv2.INTER_NEAREST)
+                ooi_mask = (m[y : y + h, x : x + w] > 0)
 
         if self.patch_size is not None:
             # Random crop.
@@ -497,10 +512,19 @@ class Dataset:
             image = image[y : y + self.patch_size, x : x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
-            if per_image_mask is not None:
-                per_image_mask = per_image_mask[
-                    y : y + self.patch_size, x : x + self.patch_size
-                ]
+            if bg_mask is not None:
+                bg_mask = bg_mask[y : y + self.patch_size, x : x + self.patch_size]
+            if ooi_mask is not None:
+                ooi_mask = ooi_mask[y : y + self.patch_size, x : x + self.patch_size]
+
+        # Combine per-image masks with the undistortion ROI mask.
+        # cam_mask clips both user masks to the valid undistorted region. If no ooi_mask
+        # ooi_mask is clipped to the valid undistorted region; if none was provided, cam_mask
+        # itself becomes the ooi_mask. bg_mask covers its own region plus pixels outside the
+        # valid undistorted region (cam_mask False), so the rasterizer fills those with bg_color.
+        if cam_mask is not None:
+            ooi_mask = ooi_mask & cam_mask if ooi_mask is not None else cam_mask
+            bg_mask = (bg_mask | ~cam_mask) if bg_mask is not None else ~cam_mask
 
         data = {
             "K": torch.from_numpy(K).float(),
@@ -511,15 +535,10 @@ class Dataset:
                 index
             ],  # 0-based contiguous camera index
         }
-        # Combine undistortion ROI mask with per-image mask.
-        if per_image_mask is not None and mask is not None:
-            combined_mask = mask & per_image_mask
-        elif per_image_mask is not None:
-            combined_mask = per_image_mask
-        else:
-            combined_mask = mask  # may be None
-        if combined_mask is not None:
-            data["mask"] = torch.from_numpy(combined_mask).bool()
+        if ooi_mask is not None:
+            data["ooi_mask"] = torch.from_numpy(ooi_mask).bool()
+        if bg_mask is not None:
+            data["background_mask"] = torch.from_numpy(bg_mask).bool()
 
         # Add exposure if available for this image
         exposure = self.parser.exposure_values[index]
