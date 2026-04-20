@@ -661,11 +661,16 @@ class Runner:
             bg_mask = data["background_mask"].to(device) if "background_mask" in data else None
             ooi_mask = data["ooi_mask"].to(device) if "ooi_mask" in data else None
 
-            # Zero out no-loss regions: outside ooi AND outside bg.
+            # Zero out no-loss regions.
             if ooi_mask is not None:
+                # Keep region: ooi OR bg. Pixels outside both are loseless.
                 keep = ooi_mask | bg_mask if bg_mask is not None else ooi_mask
                 pixels = pixels * keep.unsqueeze(-1).float()
                 colors = colors * keep.unsqueeze(-1).float()
+            elif bg_mask is not None:
+                # No ooi_mask: only background pixels get loss; everything else is loseless.
+                pixels = pixels * bg_mask.unsqueeze(-1).float()
+                colors = colors * bg_mask.unsqueeze(-1).float()
 
             # Replace GT pixels in background regions with bg_color.
             # The rasterizer already outputs bg_color in transparent regions.
