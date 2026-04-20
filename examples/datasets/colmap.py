@@ -412,7 +412,6 @@ class Dataset:
         load_depths: bool = False,
         background_mask_dir: Optional[str] = None,
         objects_of_interest_mask_dir: Optional[str] = None,
-        object_of_interest_only: bool = False,
     ):
         self.parser = parser
         self.split = split
@@ -430,16 +429,29 @@ class Dataset:
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
-        if object_of_interest_only and objects_of_interest_mask_dir is not None:
+        if objects_of_interest_mask_dir is not None and background_mask_dir is None:
             ooi_dir_path = Path(objects_of_interest_mask_dir)
-            has_ooi_mask = [
+            has_mask = [
                 bool(list(ooi_dir_path.glob(f"{Path(self.parser.image_names[i]).stem}.*")))
                 for i in self.indices
             ]
             n_before = len(self.indices)
-            self.indices = self.indices[np.array(has_ooi_mask)]
+            self.indices = self.indices[np.array(has_mask)]
             print(
-                f"[Dataset] object_of_interest_only: kept {len(self.indices)}/{n_before} {split} images with OOI masks."
+                f"[Dataset] ooi_mask_dir only: kept {len(self.indices)}/{n_before} {split} images with OOI masks."
+            )
+        elif objects_of_interest_mask_dir is not None and background_mask_dir is not None:
+            ooi_dir_path = Path(objects_of_interest_mask_dir)
+            bg_dir_path = Path(background_mask_dir)
+            has_mask = [
+                bool(list(ooi_dir_path.glob(f"{Path(self.parser.image_names[i]).stem}.*")))
+                or bool(list(bg_dir_path.glob(f"{Path(self.parser.image_names[i]).stem}.*")))
+                for i in self.indices
+            ]
+            n_before = len(self.indices)
+            self.indices = self.indices[np.array(has_mask)]
+            print(
+                f"[Dataset] both mask dirs: kept {len(self.indices)}/{n_before} {split} images with at least one mask."
             )
 
     def __len__(self):

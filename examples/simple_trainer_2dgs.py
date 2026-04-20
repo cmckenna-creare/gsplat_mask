@@ -72,9 +72,8 @@ class Config:
     # Path to folder of per-image objects-of-interest masks. Defines the region to keep:
     # pixels outside this mask (and not covered by background_mask_dir) have their loss
     # zeroed out. background_mask_dir takes priority over objects_of_interest_mask_dir.
+    # When set without background_mask_dir, only images with a matching mask file are trained.
     objects_of_interest_mask_dir: Optional[str] = None
-    # If True, skip training images that have no corresponding mask in objects_of_interest_mask_dir.
-    object_of_interest_only: bool = False
     # RGB background color (0–255) used for background_mask regions
     background_color: Tuple[int, int, int] = (0, 255, 0)
     # Directory to save results
@@ -306,9 +305,6 @@ class Runner:
         self.device = "cuda"
 
         assert not (
-            cfg.object_of_interest_only and cfg.objects_of_interest_mask_dir is None
-        ), "object_of_interest_only=True requires objects_of_interest_mask_dir to be set"
-        assert not (
             cfg.random_bkgd and cfg.background_mask_dir is not None
         ), "random_bkgd and background_mask_dir are mutually exclusive"
 
@@ -340,7 +336,6 @@ class Runner:
             load_depths=cfg.depth_loss,
             background_mask_dir=cfg.background_mask_dir,
             objects_of_interest_mask_dir=cfg.objects_of_interest_mask_dir,
-            object_of_interest_only=cfg.object_of_interest_only,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -673,10 +668,12 @@ class Runner:
                 colors = colors * bg_mask.unsqueeze(-1).float()
 
             # Replace GT pixels in background regions with bg_color.
+            # ooi_mask takes priority: pixels true in both keep their GT value.
             # The rasterizer already outputs bg_color in transparent regions.
             if bg_mask is not None:
+                effective_bg = bg_mask & ~ooi_mask if ooi_mask is not None else bg_mask
                 bg = bg_color.reshape(1, 1, 1, 3)
-                pixels = torch.where(bg_mask.unsqueeze(-1), bg.expand_as(pixels), pixels)
+                pixels = torch.where(effective_bg.unsqueeze(-1), bg.expand_as(pixels), pixels)
 
             # loss
             l1loss = F.l1_loss(colors, pixels)
