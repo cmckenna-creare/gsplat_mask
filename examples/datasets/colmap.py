@@ -412,6 +412,7 @@ class Dataset:
         load_depths: bool = False,
         background_mask_dir: Optional[str] = None,
         objects_of_interest_mask_dir: Optional[str] = None,
+        no_ooi_all_background: bool = True,
     ):
         self.parser = parser
         self.split = split
@@ -419,6 +420,7 @@ class Dataset:
         self.load_depths = load_depths
         self.background_mask_dir = background_mask_dir
         self.ooi_mask_dir = objects_of_interest_mask_dir
+        self.no_ooi_all_background = no_ooi_all_background
         self._bg_mask_warned = False
         self._ooi_mask_warned = False
         for label, d in [("background_mask_dir", background_mask_dir), ("objects_of_interest_mask_dir", objects_of_interest_mask_dir)]:
@@ -429,6 +431,17 @@ class Dataset:
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
+        if not no_ooi_all_background and objects_of_interest_mask_dir is not None:
+            ooi_dir_path = Path(objects_of_interest_mask_dir)
+            has_ooi = [
+                bool(list(ooi_dir_path.glob(f"{Path(self.parser.image_names[i]).stem}.*")))
+                for i in self.indices
+            ]
+            n_before = len(self.indices)
+            self.indices = self.indices[np.array(has_ooi)]
+            print(
+                f"[Dataset] no_ooi_all_background=False: kept {len(self.indices)}/{n_before} {split} images with OOI masks."
+            )
 
     def __len__(self):
         return len(self.indices)
@@ -506,8 +519,8 @@ class Dataset:
                 ooi_mask = ooi_mask[y : y + self.patch_size, x : x + self.patch_size]
 
         # If ooi_mask_dir is set but no ooi mask was found, and no bg mask was found either,
-        # treat the background as covering the entire image.
-        if self.ooi_mask_dir is not None and ooi_mask is None and bg_mask is None:
+        # treat the background as covering the entire image (only when no_ooi_all_background=True).
+        if self.no_ooi_all_background and self.ooi_mask_dir is not None and ooi_mask is None and bg_mask is None:
             bg_mask = np.ones(image.shape[:2], dtype=bool)
 
         # Combine per-image masks with the undistortion ROI mask.

@@ -72,8 +72,11 @@ class Config:
     # Path to folder of per-image objects-of-interest masks. Defines the region to keep:
     # pixels outside this mask (and not covered by background_mask_dir) have their loss
     # zeroed out. background_mask_dir takes priority over objects_of_interest_mask_dir.
-    # When set without background_mask_dir, only images with a matching mask file are trained.
     objects_of_interest_mask_dir: Optional[str] = None
+    # When objects_of_interest_mask_dir is set and an image has no OOI mask:
+    # True  → treat background as covering the entire image (background_match on all pixels).
+    # False → skip images with no OOI mask.
+    no_ooi_all_background: bool = True
     # RGB background color (0–255) used for background_mask regions
     background_color: Tuple[int, int, int] = (0, 255, 0)
     # Directory to save results
@@ -336,6 +339,7 @@ class Runner:
             load_depths=cfg.depth_loss,
             background_mask_dir=cfg.background_mask_dir,
             objects_of_interest_mask_dir=cfg.objects_of_interest_mask_dir,
+            no_ooi_all_background=cfg.no_ooi_all_background,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
