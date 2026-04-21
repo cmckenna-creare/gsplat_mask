@@ -622,7 +622,7 @@ class Runner:
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB+D",
                 distloss=self.cfg.dist_loss,
             )
-            if "background_mask" in data:
+            if "background_mask" in data and step <= cfg.refine_stop_iter:
                 rasterize_kwargs["backgrounds"] = bg_color.unsqueeze(0).expand(
                     camtoworlds.shape[0], -1
                 )  # [C, 3]
@@ -659,14 +659,15 @@ class Runner:
             )
             bg_mask = data["background_mask"].to(device) if "background_mask" in data else None
             ooi_mask = data["ooi_mask"].to(device) if "ooi_mask" in data else None
+            use_bg_loss = bg_mask is not None and step <= cfg.refine_stop_iter
 
             # Zero out no-loss regions.
             if ooi_mask is not None:
-                # Keep region: ooi OR bg. Pixels outside both are loseless.
-                keep = ooi_mask | bg_mask if bg_mask is not None else ooi_mask
+                # Keep region: ooi OR (bg, while bg loss is active). Pixels outside are loseless.
+                keep = ooi_mask | bg_mask if use_bg_loss else ooi_mask
                 pixels = pixels * keep.unsqueeze(-1).float()
                 colors = colors * keep.unsqueeze(-1).float()
-            elif bg_mask is not None:
+            elif use_bg_loss:
                 # No ooi_mask: only background pixels get loss; everything else is loseless.
                 pixels = pixels * bg_mask.unsqueeze(-1).float()
                 colors = colors * bg_mask.unsqueeze(-1).float()
@@ -674,7 +675,8 @@ class Runner:
             # Replace GT pixels in background regions with bg_color.
             # ooi_mask takes priority: pixels true in both keep their GT value.
             # The rasterizer already outputs bg_color in transparent regions.
-            if bg_mask is not None:
+            # After refine_stop_iter, background pixels are lossless instead.
+            if use_bg_loss:
                 effective_bg = bg_mask & ~ooi_mask if ooi_mask is not None else bg_mask
                 bg = bg_color.reshape(1, 1, 1, 3)
                 pixels = torch.where(effective_bg.unsqueeze(-1), bg.expand_as(pixels), pixels)
