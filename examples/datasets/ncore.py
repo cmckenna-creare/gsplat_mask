@@ -38,7 +38,6 @@ from .normalize import (
     transform_points,
 )
 
-
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
@@ -58,8 +57,10 @@ class CameraRenderData:
 
 
 def _build_pinhole_K(
-    model_params: ncore.data.OpenCVPinholeCameraModelParameters
-    | ncore.data.OpenCVFisheyeCameraModelParameters,
+    model_params: (
+        ncore.data.OpenCVPinholeCameraModelParameters
+        | ncore.data.OpenCVFisheyeCameraModelParameters
+    ),
 ) -> np.ndarray:
     """Return a 3x3 pinhole intrinsic matrix. Caller guarantees focal_length and principal_point exist."""
     fl = model_params.focal_length
@@ -705,9 +706,9 @@ class NCoreDataset(torch.utils.data.Dataset):
 
         # Per-worker sequence loader (lazily initialised).
         self._sequence_loader: Optional[ncore.data.SequenceLoaderProtocol] = None
-        self._camera_sensors: Optional[
-            Dict[str, ncore.data.CameraSensorProtocol]
-        ] = None
+        self._camera_sensors: Optional[Dict[str, ncore.data.CameraSensorProtocol]] = (
+            None
+        )
         self._current_worker_id: Optional[int] = None
 
     def _init_worker(self) -> None:
