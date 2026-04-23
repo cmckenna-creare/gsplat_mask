@@ -906,6 +906,8 @@ class Runner:
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
             height, width = pixels.shape[1:3]
+            image_ids = data["image_id"].to(device)
+            camera_idcs = data["camera_idx"].to(device)
 
             torch.cuda.synchronize()
             tic = time.time()
@@ -926,6 +928,8 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 render_mode="RGB+ED",
+                frame_idcs=image_ids,
+                camera_idcs=camera_idcs,
             )  # [1, H, W, 3]
             colors = torch.clamp(colors, 0.0, 1.0)
             colors = colors[..., :3]  # Take RGB channels
