@@ -931,7 +931,7 @@ def rasterization(
                     output_splits=collected_splits,
                 )
             else:
-                means2d, depths, conics, opacities = all_to_all_tensor_list(
+                (means2d, depths, conics, opacities) = all_to_all_tensor_list(
                     world_size,
                     [means2d, depths, conics, opacities],
                     cnts,
@@ -1004,7 +1004,7 @@ def rasterization(
                 )
                 proj_features = reshape_view(C, proj_features, N_world)
             else:
-                means2d, depths, conics, opacities = all_to_all_tensor_list(
+                (means2d, depths, conics, opacities) = all_to_all_tensor_list(
                     world_size,
                     [
                         means2d.flatten(0, 1),

@@ -477,7 +477,7 @@ def parse_lidar_camera(
             elevation_end,
             n_rows,
             dtype=torch.float32,
-            device=device,
+            device=device
             # Add small noise, but make sure it's not larger than the spacing between each row.
         )
         + (
