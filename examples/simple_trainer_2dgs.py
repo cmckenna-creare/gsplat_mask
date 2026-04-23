@@ -189,6 +189,10 @@ class Config:
     ppisp_controller_distillation: bool = False
     # Step at which the PPISP controller activates for distillation
     ppisp_controller_activation_num_steps: int = 25_000
+    # Number of steps to suppress PPISP regularization loss after each opacity reset.
+    # Opacity resets cause a transient in rendered appearance; suppressing the reg loss
+    # during recovery avoids penalizing the PPISP module for this artifact.
+    ppisp_reset_pause_steps: int = 0
 
     # Model for splatting.
     model_type: Literal["2dgs", "2dgs-inria"] = "2dgs"
@@ -210,6 +214,7 @@ class Config:
         self.ppisp_controller_activation_num_steps = int(
             self.ppisp_controller_activation_num_steps * factor
         )
+        self.ppisp_reset_pause_steps = int(self.ppisp_reset_pause_steps * factor)
 
 
 def create_splats_with_optimizers(
@@ -426,6 +431,8 @@ class Runner:
 
         # Track if Gaussians are frozen (for controller distillation)
         self._gaussians_frozen = False
+        # Step until which PPISP reg loss is suppressed (after opacity resets)
+        self._ppisp_pause_until: int = 0
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
@@ -749,7 +756,8 @@ class Runner:
                 post_processing_reg_loss = (
                     self.post_processing_module.get_regularization_loss()
                 )
-                loss += post_processing_reg_loss
+                if step >= self._ppisp_pause_until:
+                    loss += post_processing_reg_loss
 
             loss.backward()
 
@@ -802,6 +810,14 @@ class Runner:
                 info=info,
                 packed=cfg.packed,
             )
+            if (
+                cfg.post_processing == "ppisp"
+                and cfg.ppisp_reset_pause_steps > 0
+                and step > 0
+                and step % cfg.reset_every == 0
+                and step < cfg.refine_stop_iter
+            ):
+                self._ppisp_pause_until = step + cfg.ppisp_reset_pause_steps + 1
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
