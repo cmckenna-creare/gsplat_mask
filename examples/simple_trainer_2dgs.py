@@ -516,7 +516,7 @@ class Runner:
         height: int,
         frame_idcs: Optional[Tensor] = None,
         camera_idcs: Optional[Tensor] = None,
-        scene_mask: Optional[Tensor] = None,
+        loss_mask: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
@@ -606,13 +606,13 @@ class Runner:
                 frame_idx=frame_idx,
                 exposure_prior=None,
             )
-            # Bypass PPISP outside the scene-content region. Background-region
-            # supervision compares the render against a constant bg_color, so
-            # letting PPISP act there would train its parameters toward identity
-            # on bg_color — contaminating exposure/vignetting/color/CRF with a
-            # signal that has nothing to do with scene content.
-            if scene_mask is not None:
-                rgb = torch.where(scene_mask.unsqueeze(-1), rgb, rgb_pre)
+            # Bypass PPISP outside loss_mask. Background-region supervision
+            # compares the render against a constant bg_color, so letting PPISP
+            # act there would train its parameters toward identity on bg_color
+            # — contaminating exposure/vignetting/color/CRF with a signal that
+            # has nothing to do with scene content.
+            if loss_mask is not None:
+                rgb = torch.where(loss_mask.unsqueeze(-1), rgb, rgb_pre)
             render_colors = (
                 torch.cat([rgb, extra], dim=-1) if extra is not None else rgb
             )
@@ -673,6 +673,14 @@ class Runner:
         )  # [3]
 
         # Training loop.
+        loss_mask_active = (
+            cfg.background_mask_dir is not None
+            or cfg.objects_of_interest_mask_dir is not None
+        )
+        bg_loss_active = (
+            cfg.background_mask_dir is not None
+            or (cfg.objects_of_interest_mask_dir is not None and cfg.no_ooi_all_background)
+        )
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
@@ -720,21 +728,12 @@ class Runner:
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
-            # Load masks before rasterize so scene_mask can gate PPISP inside rasterize_splats.
-            bg_mask = data["background_mask"].to(device) if "background_mask" in data else None
-            ooi_mask = data["ooi_mask"].to(device) if "ooi_mask" in data else None
-            use_bg_loss = bg_mask is not None and step <= cfg.refine_stop_iter
-            
-            # Scene-content region for auxiliary losses (depth, normal, dist): real
-            # scene supervision applies inside ooi_mask, or outside bg_mask when only
-            # bg_mask is given. Auxiliary constraints shouldn't be enforced on pixels
-            # we're explicitly marking as background.
-            if ooi_mask is not None:
-                scene_mask = ooi_mask
-            elif bg_mask is not None:
-                scene_mask = ~bg_mask
-            else:
-                scene_mask = None
+            # loss_mask: pixels where regular loss + PPISP apply.
+            # bg_loss_mask: pixels driven toward bg_color during refinement.
+            # Disjoint by colmap.py construction.
+            loss_mask = data["loss_mask"].to(device)
+            bg_loss_mask = data["bg_loss_mask"].to(device)
+            use_bg_loss = bg_loss_active and step <= cfg.refine_stop_iter
 
             # forward
             rasterize_kwargs = dict(
@@ -746,7 +745,7 @@ class Runner:
                 distloss=self.cfg.dist_loss,
                 frame_idcs=image_ids,
                 camera_idcs=camera_idcs,
-                scene_mask=scene_mask,
+                loss_mask=loss_mask,
             )
             if use_bg_loss:
                 rasterize_kwargs["backgrounds"] = bg_color.unsqueeze(0).expand(
@@ -783,30 +782,27 @@ class Runner:
                 step=step,
                 info=info,
             )
-            # Zero out no-loss regions. Loss region: scene-content plus bg while
-            # bg loss is active. After refine_stop_iter, bg pixels drop out and
-            # become lossless. Pixels outside loss_mask are zeroed on both sides, so
-            # they contribute no gradient.
-            if scene_mask is not None:
-                loss_mask = scene_mask | bg_mask if use_bg_loss else scene_mask
-                pixels = pixels * loss_mask.unsqueeze(-1).float()
-                colors = colors * loss_mask.unsqueeze(-1).float()
+            # Active loss region. During the bg-loss phase, bg_loss_mask pixels
+            # also contribute (driven toward bg_color). After refine_stop_iter
+            # they drop out and become lossless.
+            active_mask = loss_mask | bg_loss_mask if use_bg_loss else loss_mask
+            if loss_mask_active:
+                pixels = pixels * active_mask.unsqueeze(-1).float()
+                colors = colors * active_mask.unsqueeze(-1).float()
 
-            # Replace GT pixels in background regions with bg_color.
-            # ooi_mask takes priority: pixels true in both keep their GT value.
-            # The rasterizer already outputs bg_color in transparent regions.
-            # After refine_stop_iter, background pixels are lossless instead.
+            # Drive GT toward bg_color on bg_loss_mask pixels so the rasterizer
+            # learns transparency there. bg_loss_mask is disjoint from loss_mask
+            # by colmap construction.
             if use_bg_loss:
-                effective_bg = bg_mask & ~ooi_mask if ooi_mask is not None else bg_mask
                 bg = bg_color.reshape(1, 1, 1, 3)
-                pixels = torch.where(effective_bg.unsqueeze(-1), bg.expand_as(pixels), pixels)
+                pixels = torch.where(bg_loss_mask.unsqueeze(-1), bg.expand_as(pixels), pixels)
 
             # loss
-            if scene_mask is not None:
+            if loss_mask_active:
                 # Masked mean: sum of errors divided by kept pixels × channels, so
                 # loss magnitude and gradient scale don't depend on mask coverage.
                 l1loss = F.l1_loss(colors, pixels, reduction="sum") / (
-                    loss_mask.sum().clamp(min=1) * 3
+                    active_mask.sum().clamp(min=1) * 3
                 )
             else:
                 l1loss = F.l1_loss(colors, pixels)
@@ -816,10 +812,10 @@ class Runner:
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
                 depthloss = torch.tensor(0.0, device=device)
-                if scene_mask is not None:
+                if loss_mask_active:
                     pts_x = points[0, :, 0].long().clamp(0, width - 1)
                     pts_y = points[0, :, 1].long().clamp(0, height - 1)
-                    valid = scene_mask[0, pts_y, pts_x]
+                    valid = loss_mask[0, pts_y, pts_x]
                     if valid.any():
                         points = points[:, valid, :]
                         depths_gt = depths_gt[:, valid]
@@ -857,8 +853,8 @@ class Runner:
                     normals_from_depth = normals_from_depth.squeeze(0)
                 normals_from_depth = normals_from_depth.permute((2, 0, 1))
                 normal_error = (1 - (normals * normals_from_depth).sum(dim=0))[None]
-                if scene_mask is not None and scene_mask.any():
-                    normalloss = curr_normal_lambda * normal_error[scene_mask].mean()
+                if loss_mask_active and loss_mask.any():
+                    normalloss = curr_normal_lambda * normal_error[loss_mask].mean()
                 else:
                     normalloss = curr_normal_lambda * normal_error.mean()
                 loss += normalloss
@@ -868,8 +864,8 @@ class Runner:
                     curr_dist_lambda = cfg.dist_lambda
                 else:
                     curr_dist_lambda = 0.0
-                if scene_mask is not None and scene_mask.any():
-                    distloss = render_distort[scene_mask.unsqueeze(-1)].mean()
+                if loss_mask_active and loss_mask.any():
+                    distloss = render_distort[loss_mask.unsqueeze(-1)].mean()
                 else:
                     distloss = render_distort.mean()
                 loss += distloss * curr_dist_lambda

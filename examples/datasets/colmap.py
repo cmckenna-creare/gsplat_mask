@@ -480,14 +480,58 @@ class Dataset:
 
         # Load per-image masks from both directories.
         target_h, target_w = image.shape[:2]
-        bg_mask = (
-            self._load_mask_file(self.background_mask_dir, image_name, target_h, target_w, "_bg_mask_warned")
-            if self.background_mask_dir is not None else None
-        )
-        ooi_mask = (
-            self._load_mask_file(self.ooi_mask_dir, image_name, target_h, target_w, "_ooi_mask_warned")
-            if self.ooi_mask_dir is not None else None
-        )
+
+        # loss_mask is where loss is computed normally and ppisp is appied
+        # bg_loss_mask is where the colors in the image are set to match the background
+        # The rest is assumes to be lossless
+        if self.ooi_mask_dir is not None:
+            ooi_mask = self._load_mask_file(
+                self.ooi_mask_dir, image_name, target_h, target_w, "_ooi_mask_warned"
+            )
+        else:
+            ooi_mask = None
+
+        if self.background_mask_dir is not None:
+            bg_mask = self._load_mask_file(
+                self.background_mask_dir, image_name, target_h, target_w, "_bg_mask_warned"
+            )
+        else:
+            bg_mask = None
+
+        if self.ooi_mask_dir is not None:
+            if ooi_mask is not None:
+                loss_mask = ooi_mask
+            else:
+                loss_mask = np.zeros(image.shape[:2], dtype=bool)
+        elif self.background_mask_dir is not None:
+            if bg_mask is not None:
+                loss_mask = ~bg_mask
+            else:
+                loss_mask = np.ones(image.shape[:2], dtype=bool)
+        else:
+            loss_mask = np.ones(image.shape[:2], dtype=bool)
+
+        if self.ooi_mask_dir is not None:
+            if self.no_ooi_all_background:
+                if ooi_mask is None:
+                    bg_loss_mask = np.ones(image.shape[:2], dtype=bool)
+                elif bg_mask is not None:
+                    bg_loss_mask = bg_mask
+                else:
+                    bg_loss_mask = np.zeros(image.shape[:2], dtype=bool)
+            else:
+                if bg_mask is not None:
+                    bg_loss_mask = bg_mask
+                else:
+                    bg_loss_mask = np.zeros(image.shape[:2], dtype=bool)
+        else:
+            if bg_mask is not None:
+                bg_loss_mask = bg_mask
+            else:
+                bg_loss_mask = np.zeros(image.shape[:2], dtype=bool)
+
+        # Enforce disjointness: loss_mask wins, bg_loss_mask covers the rest.
+        bg_loss_mask &= ~loss_mask
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -498,12 +542,12 @@ class Dataset:
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
-            if bg_mask is not None:
-                m = cv2.remap(bg_mask.astype(np.uint8) * 255, mapx, mapy, cv2.INTER_NEAREST)
-                bg_mask = (m[y : y + h, x : x + w] > 0)
-            if ooi_mask is not None:
-                m = cv2.remap(ooi_mask.astype(np.uint8) * 255, mapx, mapy, cv2.INTER_NEAREST)
-                ooi_mask = (m[y : y + h, x : x + w] > 0)
+            if bg_loss_mask is not None:
+                m = cv2.remap(bg_loss_mask.astype(np.uint8) * 255, mapx, mapy, cv2.INTER_NEAREST)
+                bg_loss_mask = (m[y : y + h, x : x + w] > 0)
+            if loss_mask is not None:
+                m = cv2.remap(loss_mask.astype(np.uint8) * 255, mapx, mapy, cv2.INTER_NEAREST)
+                loss_mask = (m[y : y + h, x : x + w] > 0)
 
         if self.patch_size is not None:
             # Random crop.
@@ -513,24 +557,14 @@ class Dataset:
             image = image[y : y + self.patch_size, x : x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
-            if bg_mask is not None:
-                bg_mask = bg_mask[y : y + self.patch_size, x : x + self.patch_size]
-            if ooi_mask is not None:
-                ooi_mask = ooi_mask[y : y + self.patch_size, x : x + self.patch_size]
+            if bg_loss_mask is not None:
+                bg_loss_mask = bg_loss_mask[y : y + self.patch_size, x : x + self.patch_size]
+            if loss_mask is not None:
+                loss_mask = loss_mask[y : y + self.patch_size, x : x + self.patch_size]
 
-        # If ooi_mask_dir is set but no ooi mask was found, and no bg mask was found either,
-        # treat the background as covering the entire image (only when no_ooi_all_background=True).
-        if self.no_ooi_all_background and self.ooi_mask_dir is not None and ooi_mask is None and bg_mask is None:
-            bg_mask = np.ones(image.shape[:2], dtype=bool)
-
-        # Combine per-image masks with the undistortion ROI mask.
-        # cam_mask clips both user masks to the valid undistorted region. If no ooi_mask
-        # ooi_mask is clipped to the valid undistorted region; if none was provided, cam_mask
-        # itself becomes the ooi_mask. bg_mask covers its own region plus pixels outside the
-        # valid undistorted region (cam_mask False), so the rasterizer fills those with bg_color.
         if cam_mask is not None:
-            ooi_mask = ooi_mask & cam_mask if ooi_mask is not None else cam_mask
-            bg_mask = (bg_mask | ~cam_mask) if bg_mask is not None else ~cam_mask
+            loss_mask = loss_mask & cam_mask
+            bg_loss_mask = bg_loss_mask & cam_mask
 
         data = {
             "K": torch.from_numpy(K).float(),
@@ -541,10 +575,10 @@ class Dataset:
                 index
             ],  # 0-based contiguous camera index
         }
-        if ooi_mask is not None:
-            data["ooi_mask"] = torch.from_numpy(ooi_mask).bool()
-        if bg_mask is not None:
-            data["background_mask"] = torch.from_numpy(bg_mask).bool()
+        if loss_mask is not None:
+            data["loss_mask"] = torch.from_numpy(loss_mask).bool()
+        if bg_loss_mask is not None:
+            data["bg_loss_mask"] = torch.from_numpy(bg_loss_mask).bool()
 
         # Add exposure if available for this image
         exposure = self.parser.exposure_values[index]
@@ -575,7 +609,6 @@ class Dataset:
             data["depths"] = torch.from_numpy(depths).float()
 
         return data
-
 
 if __name__ == "__main__":
     import argparse
