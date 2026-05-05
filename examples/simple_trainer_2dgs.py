@@ -168,6 +168,8 @@ class Config:
     absgrad: bool = False
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
+    # Cull Gaussians whose local +z normal points away from the camera (hard cull).
+    backface_culling: bool = False
     # Whether to use revised opacity heuristic from arXiv:2404.06109 (experimental)
     revised_opacity: bool = False
 
@@ -563,6 +565,7 @@ class Runner:
                 packed=self.cfg.packed,
                 absgrad=self.cfg.absgrad,
                 sparse_grad=self.cfg.sparse_grad,
+                backface_culling=self.cfg.backface_culling,
                 **kwargs,
             )
         elif self.model_type == "2dgs-inria":

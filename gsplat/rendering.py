@@ -53,7 +53,7 @@ from .distributed import (
     all_to_all_int32,
     all_to_all_tensor_list,
 )
-from .utils import depth_to_normal, get_projection_matrix
+from .utils import depth_to_normal, get_projection_matrix, normalized_quat_to_rotmat
 
 # Gaussian depth modes (D/ED): use projection depth (controlled by global_z_order)
 # Hit distance modes (d/Ed): compute along-ray distance in rasterization
@@ -1977,6 +1977,7 @@ def rasterization_2dgs(
     absgrad: bool = False,
     distloss: bool = False,
     depth_mode: Literal["expected", "median"] = "expected",
+    backface_culling: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict]:
     """Rasterize a set of 2D Gaussians (N) to a batch of image planes (C).
 
@@ -2026,6 +2027,8 @@ def rasterization_2dgs(
             will be done looply in chunks.
         distloss: If true, use distortion regularization to get better geometry detail.
         depth_mode: render depth mode. Choose from expected depth and median depth.
+        backface_culling: If true, skip Gaussians whose local +z normal points away
+            from the camera. Hard cull (radii zeroed) — non-differentiable. Default False.
 
     Returns:
         A tuple:
@@ -2161,6 +2164,32 @@ def rasterization_2dgs(
         )  # [..., C, N]
         camera_ids, gaussian_ids = None, None
         image_ids = None
+
+    if backface_culling:
+        # Detect Gaussians whose unflipped local +z normal points away from camera
+        # and zero their radii so isect_tiles skips them. The CUDA projection always
+        # flips normals to face the camera, so we recompute pre-flip normals here.
+        R_local = normalized_quat_to_rotmat(
+            F.normalize(quats, dim=-1)
+        )  # [..., N, 3, 3]
+        n_world = R_local[..., 2]  # [..., N, 3]
+        Rv = viewmats[..., :3, :3]  # [..., C, 3, 3]
+        tv = viewmats[..., :3, 3]  # [..., C, 3]
+        n_cam = torch.einsum(
+            "...cij,...nj->...cni", Rv, n_world
+        )  # [..., C, N, 3]
+        means_c = (
+            torch.einsum("...cij,...nj->...cni", Rv, means)
+            + tv[..., None, :]
+        )  # [..., C, N, 3]
+        back = (n_cam * means_c).sum(dim=-1) > 0  # [..., C, N]
+        if packed:
+            back_packed = back.reshape(B, C, N)[
+                batch_ids, camera_ids, gaussian_ids
+            ]  # [nnz]
+            radii = radii.masked_fill(back_packed[:, None], 0)
+        else:
+            radii = radii.masked_fill(back[..., None], 0)
 
     densify = torch.zeros_like(
         means2d, dtype=means.dtype, requires_grad=True, device="cuda"
