@@ -65,13 +65,20 @@ class Config:
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
-    # Path to folder of per-image background masks. Where True, background_match masking is
-    # applied: GT pixels are set to background_color and the rasterizer is set to the same
-    # background so Gaussians in those regions learn to be transparent.
-    background_mask_dir: Optional[str] = None
+    # Path to folder of per-image background masks used for the FIRST training phase.
+    # Where True, background_match masking is applied: GT pixels are set to
+    # background_color and the rasterizer is set to the same background so Gaussians in
+    # those regions learn to be transparent.
+    background_mask_dir_1: Optional[str] = None
+    # Optional second background-mask directory. When set, training switches from
+    # background_mask_dir_1 to background_mask_dir_2 at background_mask_switch_step.
+    background_mask_dir_2: Optional[str] = None
+    # Global step at which to switch from background_mask_dir_1 to background_mask_dir_2.
+    # Required iff background_mask_dir_2 is set; must be in [0, max_steps].
+    background_mask_switch_step: Optional[int] = None
     # Path to folder of per-image objects-of-interest masks. Defines the region to keep:
-    # pixels outside this mask (and not covered by background_mask_dir) have their loss
-    # zeroed out. ooi takes priorety over background.
+    # pixels outside this mask (and not covered by the active background mask) have
+    # their loss zeroed out. ooi takes priorety over background.
     objects_of_interest_mask_dir: Optional[str] = None
     # When objects_of_interest_mask_dir is set and an image has no OOI mask:
     # True  → treat background as covering the entire image (background_match on all pixels).
@@ -135,7 +142,8 @@ class Config:
     grow_scale3d: float = 0.01
     # GSs with scale above this value will be pruned.
     prune_scale3d: float = 0.1
-    # Prune Gaussians whose base color is close to background_color (requires background_mask_dir)
+    # Prune Gaussians whose base color is close to background_color (requires at least
+    # one of background_mask_dir_1 / background_mask_dir_2)
     prune_bg_color: bool = False
     # L2 distance threshold in [0, 1] RGB space; Gaussians closer than this are pruned
     prune_bg_color_threshold: float = 0.1
@@ -328,10 +336,27 @@ class Runner:
         self.cfg = cfg
         self.device = "cuda"
 
-        if (cfg.random_bkgd and cfg.background_mask_dir is not None):
+        any_bg_mask_dir = (
+            cfg.background_mask_dir_1 is not None
+            or cfg.background_mask_dir_2 is not None
+        )
+        if cfg.random_bkgd and any_bg_mask_dir:
             raise ValueError(
-                f"random_bkgd and background_mask_dir are mutually exclusive"
+                "random_bkgd and background_mask_dir_{1,2} are mutually exclusive"
             )
+
+        if cfg.background_mask_dir_2 is not None:
+            if cfg.background_mask_switch_step is None:
+                raise ValueError(
+                    "background_mask_switch_step must be set when "
+                    "background_mask_dir_2 is provided"
+                )
+            max_steps = int(cfg.max_steps * cfg.steps_scaler)
+            if not (0 <= cfg.background_mask_switch_step <= max_steps):
+                raise ValueError(
+                    f"background_mask_switch_step={cfg.background_mask_switch_step} "
+                    f"must lie in [0, max_steps={max_steps}]"
+                )
 
         if cfg.post_processing == "ppisp" and cfg.batch_size != 1:
             raise ValueError(
@@ -364,7 +389,7 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
-            background_mask_dir=cfg.background_mask_dir,
+            background_mask_dir=cfg.background_mask_dir_1,
             objects_of_interest_mask_dir=cfg.objects_of_interest_mask_dir,
             no_ooi_all_background=cfg.no_ooi_all_background,
         )
@@ -415,7 +440,7 @@ class Runner:
             prune_floater_knn=cfg.prune_floater_knn,
             prune_floater_factor=cfg.prune_floater_factor,
             prune_floater_every=cfg.prune_floater_every,
-            prune_bg_color=cfg.prune_bg_color and cfg.background_mask_dir is not None,
+            prune_bg_color=cfg.prune_bg_color and any_bg_mask_dir,
             prune_bg_color_rgb=tuple(c / 255.0 for c in cfg.background_color),
             prune_bg_color_threshold=cfg.prune_bg_color_threshold,
         )
@@ -661,27 +686,43 @@ class Runner:
             )
             schedulers.extend(ppisp_schedulers)
 
-        trainloader = torch.utils.data.DataLoader(
-            self.trainset,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=4,
-            persistent_workers=True,
-            pin_memory=True,
-        )
+        def _make_trainloader(bg_mask_dir: Optional[str]) -> torch.utils.data.DataLoader:
+            self.trainset = Dataset(
+                self.parser,
+                split="train",
+                patch_size=cfg.patch_size,
+                load_depths=cfg.depth_loss,
+                background_mask_dir=bg_mask_dir,
+                objects_of_interest_mask_dir=cfg.objects_of_interest_mask_dir,
+                no_ooi_all_background=cfg.no_ooi_all_background,
+            )
+            return torch.utils.data.DataLoader(
+                self.trainset,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                num_workers=4,
+                persistent_workers=True,
+                pin_memory=True,
+            )
+
+        trainloader = _make_trainloader(cfg.background_mask_dir_1)
         trainloader_iter = iter(trainloader)
 
         bg_color = (
             torch.tensor(cfg.background_color, dtype=torch.float32, device=device) / 255.0
         )  # [3]
 
-        # Training loop.
+        # Training loop. Flags are True if either phase has the relevant mask dir set;
+        # the per-step branches below stay correct because the dataset returns
+        # all-pass / all-zero masks when no dir is active in the current phase.
         loss_mask_active = (
-            cfg.background_mask_dir is not None
+            cfg.background_mask_dir_1 is not None
+            or cfg.background_mask_dir_2 is not None
             or cfg.objects_of_interest_mask_dir is not None
         )
         bg_loss_active = (
-            cfg.background_mask_dir is not None
+            cfg.background_mask_dir_1 is not None
+            or cfg.background_mask_dir_2 is not None
             or (cfg.objects_of_interest_mask_dir is not None and cfg.no_ooi_all_background)
         )
         global_tic = time.time()
@@ -701,6 +742,20 @@ class Runner:
                 and step >= cfg.ppisp_controller_activation_num_steps
             ):
                 self.freeze_gaussians()
+
+            # Switch to the second background-mask directory at the configured step.
+            if (
+                cfg.background_mask_dir_2 is not None
+                and step == cfg.background_mask_switch_step
+            ):
+                print(
+                    f"[Dataset] Switching background_mask_dir to "
+                    f"{cfg.background_mask_dir_2} at step {step}"
+                )
+                del trainloader_iter
+                del trainloader
+                trainloader = _make_trainloader(cfg.background_mask_dir_2)
+                trainloader_iter = iter(trainloader)
 
             try:
                 data = next(trainloader_iter)
