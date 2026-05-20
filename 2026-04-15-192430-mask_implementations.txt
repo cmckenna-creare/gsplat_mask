@@ -1,0 +1,207 @@
+================================================================================
+MASK SYSTEM REFERENCE — updated 2026-04-26
+================================================================================
+
+## Architecture
+
+Two independent mask directories, both optional, matched per-image by filename
+stem. Either, both, or neither may be provided for each image.
+
+  background_mask_dir          → loads bg_mask  (raw on-disk mask, intermediate)
+  objects_of_interest_mask_dir → loads ooi_mask (raw on-disk mask, intermediate)
+
+These are combined inside Dataset.__getitem__ into two role-based masks emitted
+to the trainer:
+
+  data["loss_mask"]    (bool [H, W])   — pixels where regular loss + PPISP apply
+  data["bg_loss_mask"] (bool [H, W])   — pixels driven toward background_color
+
+Both keys are ALWAYS present in the data dict (never None / missing). When no
+mask dirs are configured, loss_mask = all-True and bg_loss_mask = all-False.
+
+## Pixel-level semantics
+
+Every pixel falls into exactly one of three regions (disjoint by construction —
+colmap.py enforces `bg_loss_mask &= ~loss_mask` before emit):
+
+  loss_mask=True                  → "loss":     normal photometric loss against
+                                                real GT pixels; PPISP is applied.
+  bg_loss_mask=True               → "bg loss":  GT replaced with background_color;
+                                                rasterizer also outputs bg_color
+                                                in transparent regions, so loss
+                                                drives Gaussians toward
+                                                transparency. PPISP bypassed.
+  neither                         → "lossless": GT and rendered are zeroed before
+                                                loss; no gradient signal. PPISP
+                                                bypassed.
+
+The bg-loss phase is gated on `step <= cfg.refine_stop_iter`. After that, the
+trainer's `use_bg_loss` flag flips False and bg_loss_mask pixels become lossless
+(see "Trainer code path" step 2 below).
+
+## Trainer code path (simple_trainer_2dgs.py)
+
+bg_color is computed once before the training loop from cfg.background_color.
+
+Two cached config flags also computed once before the loop:
+
+  loss_mask_active = bg_dir is set OR ooi_dir is set
+  bg_loss_active   = bg_dir is set OR (ooi_dir is set AND no_ooi_all_background)
+
+`loss_mask_active` gates whether the masked code paths run at all (skipped for
+the unmasked case to avoid masking work and a sum reduction). `bg_loss_active`
+is the static "could any image in this run have bg-loss pixels" flag — when
+False, bg-loss code paths are skipped regardless of step.
+
+Per step:
+
+  1. Load masks (always present in data):
+       loss_mask    = data["loss_mask"].to(device)
+       bg_loss_mask = data["bg_loss_mask"].to(device)
+       use_bg_loss  = bg_loss_active and step <= cfg.refine_stop_iter
+
+  2. rasterize_splats() receives loss_mask= keyword (used to gate PPISP only —
+     see "PPISP gating" below). When use_bg_loss is True, also pass:
+       rasterize_kwargs["backgrounds"] = bg_color expanded to [C, 3]
+
+  3. After rendering:
+       active_mask = loss_mask | bg_loss_mask if use_bg_loss else loss_mask
+       if loss_mask_active:
+           pixels *= active_mask[..., None]
+           colors *= active_mask[..., None]
+
+       if use_bg_loss:
+           pixels = torch.where(bg_loss_mask[..., None], bg_color, pixels)
+
+       if loss_mask_active:
+           l1loss = sum(|colors - pixels|) / (active_mask.sum() * 3)
+       else:
+           l1loss = F.l1_loss(colors, pixels)
+
+     Note the disjointness invariant means no `bg & ~ooi` priority dance is
+     needed at the trainer — bg_loss_mask never overlaps loss_mask.
+
+  4. Auxiliary losses (depth, normal, distortion) gate on loss_mask:
+       depth: only points whose pixel falls in loss_mask are kept.
+       normal: normal_error[loss_mask].mean() when loss_mask_active and loss_mask.any().
+       dist:   render_distort[loss_mask].mean() when loss_mask_active and loss_mask.any().
+
+## PPISP gating (rasterize_splats in simple_trainer_2dgs.py)
+
+`rasterize_splats(..., loss_mask=...)` receives loss_mask and uses it to bypass
+PPISP outside the loss region:
+
+    if loss_mask is not None:
+        rgb = torch.where(loss_mask[..., None], rgb_ppisp, rgb_pre)
+
+PPISP runs everywhere internally, but its output is only retained on
+loss_mask=True pixels. On bg-loss and lossless pixels, the raw render (rgb_pre)
+is used — preventing PPISP from being trained against the constant bg_color
+signal or against zeroed-out lossless pixels.
+
+## Dataset code path (colmap.py — Dataset.__getitem__)
+
+Construction order (after image load, before geometric transforms):
+
+  1. cam_mask  = parser.mask_dict[camera_id]   — fisheye undistortion validity
+                                                  mask; None for perspective
+                                                  cameras.
+  2. ooi_mask  = _load_mask_file(ooi_mask_dir, ...)         → None if dir unset
+                                                              or file missing
+  3. bg_mask   = _load_mask_file(background_mask_dir, ...)  → None if dir unset
+                                                              or file missing
+
+  4. Build loss_mask:
+       ooi_dir set:    ooi_mask if found else all-False
+       only bg_dir:    ~bg_mask if found else all-True
+       neither:        all-True
+
+  5. Build bg_loss_mask:
+       ooi_dir set, no_ooi_all_background=True:
+           ooi missing            → all-True
+           ooi present, bg present → bg_mask
+           else                   → all-False
+       ooi_dir set, no_ooi_all_background=False:
+           bg present → bg_mask, else all-False
+       only bg_dir:
+           bg present → bg_mask, else all-False
+       neither:
+           all-False
+
+  6. Enforce disjointness:
+       bg_loss_mask &= ~loss_mask
+
+  7. Apply cv2.remap + ROI crop to both output masks (fisheye only).
+  8. Apply patch crop to both output masks (when patch_size is set).
+  9. Combine with cam_mask (perspective: skipped):
+       loss_mask    &= cam_mask
+       bg_loss_mask &= cam_mask
+     Pixels outside the valid undistorted region are lossless (excluded from
+     both masks). NOTE: this is a behavior change from the pre-2026-04-26
+     implementation, where outside-ROI pixels were OR'd into the bg mask so the
+     rasterizer would fill them with bg_color. They are now treated as no-loss.
+
+## Image filtering (colmap.py — Dataset.__init__)
+
+All images are always included EXCEPT when no_ooi_all_background=False AND
+objects_of_interest_mask_dir is set: images with no OOI mask file are dropped.
+
+  no_ooi_all_background=True  (default): all images used; missing ooi mask →
+                               bg_loss_mask = all-True at __getitem__ time
+                               (entire image is bg-loss).
+  no_ooi_all_background=False: images without an OOI mask file skipped at init.
+                               Only applies when objects_of_interest_mask_dir is set.
+
+## Per-image behavior by configuration
+
+After construction (and disjointness fix), assuming a perspective camera
+(no cam_mask clipping):
+
+  | Dirs set | ooi file | bg file | no_ooi_all_bg | loss_mask | bg_loss_mask  |
+  |----------|----------|---------|---------------|-----------|---------------|
+  | none     | n/a      | n/a     | n/a           | all-True  | all-False     |
+  | only OOI | yes      | n/a     | T or F        | ooi       | all-False     |
+  | only OOI | no       | n/a     | T             | all-False | all-True      |
+  | only OOI | no       | n/a     | F             | (image dropped at init)   |
+  | only BG  | n/a      | yes     | n/a           | ~bg       | bg            |
+  | only BG  | n/a      | no      | n/a           | all-True  | all-False     |
+  | both     | yes      | yes     | T or F        | ooi       | bg & ~ooi     |
+  | both     | yes      | no      | T or F        | ooi       | all-False     |
+  | both     | no       | yes     | T             | all-False | bg            |
+  | both     | no       | yes     | F             | (image dropped at init)   |
+  | both     | no       | no      | T             | all-False | all-True      |
+  | both     | no       | no      | F             | (image dropped at init)   |
+
+Region effects (from "Pixel-level semantics"):
+  loss_mask=True                                       → loss (full)
+  bg_loss_mask=True (and step <= refine_stop_iter)     → bg loss
+  bg_loss_mask=True (and step >  refine_stop_iter)     → lossless
+  neither                                              → lossless
+
+## Config fields (simple_trainer_2dgs.py)
+
+  background_mask_dir:           Optional[str]                = None
+  objects_of_interest_mask_dir:  Optional[str]                = None
+  no_ooi_all_background:         bool                         = True
+  background_color:              Tuple[int, int, int]         = (0, 255, 0)
+  refine_stop_iter:              int                          = 15_000
+  prune_bg_color:                bool                         = False
+  prune_bg_color_threshold:      float                        = 0.1
+
+  - prune_bg_color is only applied when background_mask_dir is not None
+    (gated at construction, line 416 of simple_trainer_2dgs.py).
+  - refine_stop_iter is the step beyond which use_bg_loss flips False and
+    bg_loss_mask pixels become lossless.
+  - random_bkgd is mutually exclusive with background_mask_dir (asserted at
+    Runner construction).
+
+## _load_mask_file helper (colmap.py — Dataset method)
+
+  def _load_mask_file(self, mask_dir, image_name, target_h, target_w, warned_attr)
+      → Optional[np.ndarray bool]
+
+  Loads the first file matching "{stem}.*" in mask_dir. Resizes to (target_w,
+  target_h) with INTER_NEAREST and casts to bool. Prints a one-time warning per
+  directory when no file is found (warned_attr: "_bg_mask_warned" /
+  "_ooi_mask_warned"). Returns None if the directory has no match for this
+  image.
