@@ -51,6 +51,11 @@ def main(local_rank: int, world_rank, world_size: int, args):
     colors = torch.cat([sh0, shN], dim=-2)
     sh_degree = int(math.sqrt(colors.shape[-2]) - 1)
     print("Number of Gaussians:", len(means))
+    spatial_bounds = {
+        "x": (means[:, 0].min().item(), means[:, 0].max().item()),
+        "y": (means[:, 1].min().item(), means[:, 1].max().item()),
+        "z": (means[:, 2].min().item(), means[:, 2].max().item()),
+    }
 
     # register and open viewer
     @torch.no_grad()
@@ -77,6 +82,12 @@ def main(local_rank: int, world_rank, world_size: int, args):
             bg = torch.tensor(render_tab_state.backgrounds, dtype=torch.float32, device=device) / 255.0
             l2_dist = (base_rgb - bg).norm(dim=-1)
             mask &= l2_dist >= render_tab_state.bg_color_filter_threshold
+        x_min, x_max = render_tab_state.x_range
+        y_min, y_max = render_tab_state.y_range
+        z_min, z_max = render_tab_state.z_range
+        mask &= (means[:, 0] >= x_min) & (means[:, 0] <= x_max)
+        mask &= (means[:, 1] >= y_min) & (means[:, 1] <= y_max)
+        mask &= (means[:, 2] >= z_min) & (means[:, 2] <= z_max)
         if not mask.all():
             r_means = means[mask]
             r_quats = quats[mask]
@@ -159,6 +170,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
         render_fn=viewer_render_fn,
         output_dir=Path(args.output_dir),
         mode="rendering",
+        spatial_bounds=spatial_bounds,
     )
     print("Viewer running... Ctrl+C to exit.")
     time.sleep(100000)

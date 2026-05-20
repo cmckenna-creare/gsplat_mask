@@ -15,7 +15,7 @@
 
 import viser
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 from typing import Tuple, Callable
 from nerfview import Viewer, RenderTabState
 
@@ -42,6 +42,9 @@ class GsplatRenderTabState(RenderTabState):
     colormap: Literal[
         "turbo", "viridis", "magma", "inferno", "cividis", "gray"
     ] = "turbo"
+    x_range: Tuple[float, float] = (-1e6, 1e6)
+    y_range: Tuple[float, float] = (-1e6, 1e6)
+    z_range: Tuple[float, float] = (-1e6, 1e6)
 
 
 class GsplatViewer(Viewer):
@@ -55,12 +58,18 @@ class GsplatViewer(Viewer):
         render_fn: Callable,
         output_dir: Path,
         mode: Literal["rendering", "training"] = "rendering",
+        spatial_bounds: Optional[dict] = None,
     ):
+        self._spatial_bounds = spatial_bounds
         super().__init__(server, render_fn, output_dir, mode)
         server.gui.set_panel_label("gsplat 2dgs viewer")
 
     def _init_rendering_tab(self):
         self.render_tab_state = GsplatRenderTabState()
+        if self._spatial_bounds is not None:
+            self.render_tab_state.x_range = self._spatial_bounds["x"]
+            self.render_tab_state.y_range = self._spatial_bounds["y"]
+            self.render_tab_state.z_range = self._spatial_bounds["z"]
         self._rendering_tab_handles = {}
         self._rendering_folder = self.server.gui.add_folder("Rendering")
 
@@ -182,6 +191,56 @@ class GsplatViewer(Viewer):
                     self.render_tab_state.bg_color_filter_threshold = bg_color_filter_slider.value
                     self.rerender(_)
 
+            with server.gui.add_folder("Spatial Filter"):
+                bounds = self._spatial_bounds
+                x_lo, x_hi = bounds["x"] if bounds else (-1e6, 1e6)
+                y_lo, y_hi = bounds["y"] if bounds else (-1e6, 1e6)
+                z_lo, z_hi = bounds["z"] if bounds else (-1e6, 1e6)
+                step = 0.01
+
+                x_range_vec2 = server.gui.add_vector2(
+                    "X Range",
+                    initial_value=self.render_tab_state.x_range,
+                    min=(x_lo, x_lo),
+                    max=(x_hi, x_hi),
+                    step=step,
+                    hint="Min and max X coordinate to include.",
+                )
+
+                @x_range_vec2.on_update
+                def _(_) -> None:
+                    self.render_tab_state.x_range = x_range_vec2.value
+                    self.rerender(_)
+
+                y_range_vec2 = server.gui.add_vector2(
+                    "Y Range",
+                    initial_value=self.render_tab_state.y_range,
+                    min=(y_lo, y_lo),
+                    max=(y_hi, y_hi),
+                    step=step,
+                    hint="Min and max Y coordinate to include.",
+                )
+
+                @y_range_vec2.on_update
+                def _(_) -> None:
+                    self.render_tab_state.y_range = y_range_vec2.value
+                    self.rerender(_)
+
+                z_range_vec2 = server.gui.add_vector2(
+                    "Z Range",
+                    initial_value=self.render_tab_state.z_range,
+                    min=(z_lo, z_lo),
+                    max=(z_hi, z_hi),
+                    step=step,
+                    hint="Min and max Z coordinate to include.",
+                )
+
+                @z_range_vec2.on_update
+                def _(_) -> None:
+                    self.render_tab_state.z_range = z_range_vec2.value
+                    self.rerender(_)
+
+            with server.gui.add_folder("Rendering Options"):
                 render_mode_dropdown = server.gui.add_dropdown(
                     "Render Mode",
                     ("rgb", "depth", "normal", "alpha"),
@@ -248,6 +307,9 @@ class GsplatViewer(Viewer):
                 "eps2d_slider": eps2d_slider,
                 "backgrounds_slider": backgrounds_slider,
                 "bg_color_filter_slider": bg_color_filter_slider,
+                "x_range_vec2": x_range_vec2,
+                "y_range_vec2": y_range_vec2,
+                "z_range_vec2": z_range_vec2,
                 "render_mode_dropdown": render_mode_dropdown,
                 "normalize_nearfar_checkbox": normalize_nearfar_checkbox,
                 "inverse_checkbox": inverse_checkbox,
